@@ -225,7 +225,7 @@ jobs:
             --data-urlencode "name=main" >/dev/null || true
 
       - name: Run Sonar scan
-        uses: SonarSource/sonarqube-scan-action@v5
+        uses: SonarSource/sonarqube-scan-action@v6
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
