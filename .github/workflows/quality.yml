@@ -212,6 +212,18 @@ jobs:
           name: coverage-xml
           path: .
 
+      - name: Normalize SonarCloud main branch
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          set +x
+          curl -fsS -u "${SONAR_TOKEN}:" -X POST "https://sonarcloud.io/api/project_branches/delete" \
+            --data-urlencode "project=RandomCodeSpace_glab-utils" \
+            --data-urlencode "branch=main" >/dev/null || true
+          curl -fsS -u "${SONAR_TOKEN}:" -X POST "https://sonarcloud.io/api/project_branches/rename" \
+            --data-urlencode "project=RandomCodeSpace_glab-utils" \
+            --data-urlencode "name=main" >/dev/null || true
+
       - name: Run Sonar scan
         uses: SonarSource/sonarqube-scan-action@v5
         env:
