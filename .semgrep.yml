@@ -37,4 +37,4 @@ rules:
     pattern-regex: '(?i)(gitlab|glpat|token|secret|password)[A-Za-z0-9_ -]{0,20}[=:][ ''"][A-Za-z0-9_\-]{12,}[ ''"]'
     paths:
       exclude:
-        - token-rotate/test_gitlab_project_token_rotator.py
+        - /token-rotate/test_gitlab_project_token_rotator.py

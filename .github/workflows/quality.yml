@@ -5,17 +5,22 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
 
 defaults:
   run:
     shell: bash
 
 jobs:
-  token-rotate-quality:
-    name: token-rotate quality gates
+  repository-sanity:
+    name: repository sanity checks
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -26,14 +31,161 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Syntax check
-        run: python -m py_compile token-rotate/gitlab_project_token_rotator.py token-rotate/test_gitlab_project_token_rotator.py token-rotate/quality_gate.py
+      - name: Validate tracked file hygiene
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          tracked = subprocess.check_output(
+              ["git", "ls-files"], text=True, encoding="utf-8"
+          ).splitlines()
+          failures = []
+          text_suffixes = {
+              ".py", ".yml", ".yaml", ".md", ".txt", ".json", ".toml", ".ini", ".cfg"
+          }
+          for rel in tracked:
+              path = Path(rel)
+              if path.suffix.lower() not in text_suffixes:
+                  continue
+              data = path.read_bytes()
+              if not data:
+                  continue
+              if b"\r\n" in data:
+                  failures.append(f"{rel}: contains CRLF line endings")
+              if not data.endswith(b"\n"):
+                  failures.append(f"{rel}: missing final newline")
+              for lineno, line in enumerate(data.splitlines(), start=1):
+                  if line.rstrip(b" \t") != line:
+                      failures.append(f"{rel}:{lineno}: trailing whitespace")
+          if failures:
+              print("Tracked file hygiene failures:")
+              print("\n".join(failures))
+              sys.exit(1)
+          print(f"Validated hygiene for {len(tracked)} tracked files.")
+          PY
+
+      - name: Validate GitHub workflow YAML syntax
+        run: |
+          ruby -e 'require "yaml"; ARGV.each { |f| YAML.load_file(f); puts "#{f}: yaml ok" }' .github/workflows/*.yml .semgrep.yml
+
+      - name: Check for hardcoded credential-like assignments
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          tracked = subprocess.check_output(["git", "ls-files"], text=True).splitlines()
+          suffixes = {".py", ".yml", ".yaml", ".json", ".toml", ".ini", ".cfg", ".md"}
+          # Looks for real-looking credential assignments while intentionally ignoring
+          # scanner rule definitions and non-secret placeholders used by tests.
+          pattern = re.compile(
+              r"(?i)\b(api[_-]?key|secret|password|passwd|private[_-]?token|access[_-]?token)\b"
+              r"\s*[:=]\s*['\"][A-Za-z0-9_./+=:-]{12,}['\"]"
+          )
+          allowlisted = {
+              ".semgrep.yml",
+              ".github/workflows/quality.yml",
+              "token-rotate/test_gitlab_project_token_rotator.py",
+          }
+          failures = []
+          for rel in tracked:
+              if rel in allowlisted or Path(rel).suffix.lower() not in suffixes:
+                  continue
+              text = Path(rel).read_text(encoding="utf-8", errors="ignore")
+              for lineno, line in enumerate(text.splitlines(), start=1):
+                  if pattern.search(line):
+                      failures.append(f"{rel}:{lineno}: possible hardcoded credential assignment")
+          if failures:
+              print("\n".join(failures))
+              sys.exit(1)
+          print("No hardcoded credential-like assignments found in tracked source files.")
+          PY
+
+  python-quality:
+    name: python ${{ matrix.python-version }} quality gates
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Confirm production script uses only standard-library imports
+        run: |
+          python - <<'PY'
+          import ast
+          import pathlib
+          import sys
+
+          source = pathlib.Path("token-rotate/gitlab_project_token_rotator.py")
+          tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+          allowed_local = {"__future__"}
+          stdlib = set(getattr(sys, "stdlib_module_names", ())) | allowed_local
+          imported = set()
+          for node in ast.walk(tree):
+              if isinstance(node, ast.Import):
+                  imported.update(alias.name.split(".")[0] for alias in node.names)
+              elif isinstance(node, ast.ImportFrom) and node.module:
+                  imported.add(node.module.split(".")[0])
+          third_party = sorted(name for name in imported if name not in stdlib)
+          if third_party:
+              print("Non-standard-library imports found in production script:", third_party)
+              sys.exit(1)
+          print("Production script imports are standard-library only.")
+          PY
+
+      - name: Compile every tracked Python file
+        run: |
+          python - <<'PY'
+          import py_compile
+          import subprocess
+          import sys
+
+          files = subprocess.check_output(
+              ["git", "ls-files", "*.py"], text=True, encoding="utf-8"
+          ).splitlines()
+          for filename in files:
+              py_compile.compile(filename, doraise=True)
+          print(f"Compiled {len(files)} Python files.")
+          PY
+
+      - name: Run unit tests without coverage first
+        run: python -m unittest discover -s token-rotate -p 'test_*.py' -v
 
       - name: Install coverage quality tool
         run: python -m pip install --upgrade coverage
 
-      - name: Unit tests and coverage gate
-        run: python token-rotate/quality_gate.py --min-coverage 80
+      - name: Run tests with branch coverage gate
+        run: python token-rotate/quality_gate.py --min-coverage 95
+
+      - name: Write coverage XML artifact
+        if: matrix.python-version == '3.12'
+        run: python -m coverage xml -o coverage.xml
+
+      - name: Upload coverage XML artifact
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+
+      - name: CLI smoke tests
+        run: |
+          python token-rotate/gitlab_project_token_rotator.py --help >/tmp/rotator-help.txt
+          python token-rotate/quality_gate.py --help >/tmp/quality-gate-help.txt
+          test -s /tmp/rotator-help.txt
+          test -s /tmp/quality-gate-help.txt
 
   semgrep:
     name: semgrep security scan
@@ -50,5 +202,5 @@ jobs:
       - name: Install Semgrep
         run: python -m pip install --upgrade semgrep
 
-      - name: Run Semgrep
-        run: semgrep scan --config .semgrep.yml --config p/python --error
+      - name: Run custom, Python, and secrets Semgrep rules
+        run: semgrep scan --config .semgrep.yml --config p/python --config p/secrets --error .

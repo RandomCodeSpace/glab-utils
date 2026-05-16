@@ -15,7 +15,7 @@ from pathlib import Path
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run tests and enforce coverage threshold.")
-    parser.add_argument("--min-coverage", type=float, default=80.0)
+    parser.add_argument("--min-coverage", type=float, default=95.0)
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent
@@ -28,7 +28,11 @@ def main() -> int:
         print("Install for development with: python3 -m pip install coverage", file=sys.stderr)
         return 2
 
-    cov = coverage.Coverage(source=[str(root)], omit=[str(root / "test_*.py"), str(root / "quality_gate.py")])
+    cov = coverage.Coverage(
+        source=[str(root)],
+        omit=[str(root / "test_*.py"), str(root / "quality_gate.py")],
+        branch=True,
+    )
     cov.start()
     suite = unittest.defaultTestLoader.discover(str(root), pattern="test_*.py")
     result = unittest.TextTestRunner(verbosity=2).run(suite)
