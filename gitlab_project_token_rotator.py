@@ -75,6 +75,7 @@ import json
 import os
 import sys
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -136,6 +137,10 @@ def days_until(expiry: date, today: date) -> int:
 
 def should_rotate(expires_at: str, threshold_days: int, today: date) -> bool:
     return days_until(parse_yyyy_mm_dd(expires_at), today) <= threshold_days
+
+
+def calculate_new_expires_at(today: date, lifetime_days: int) -> str:
+    return (today + timedelta(days=lifetime_days)).isoformat()
 
 
 def env_first(*names: str, default: Optional[str] = None) -> Optional[str]:
@@ -409,7 +414,7 @@ def run(config: Config) -> int:
         print("No rotation needed.")
         return 0
 
-    new_expires_at = (today + timedelta(days=config.new_expires_in_days)).isoformat()
+    new_expires_at = calculate_new_expires_at(today, config.new_expires_in_days)
     if config.dry_run:
         print(
             "Dry run: token would be rotated and "
@@ -491,6 +496,79 @@ class SelfTests(unittest.TestCase):
 
     def test_quote_path_segment_encodes_namespaced_project_path(self) -> None:
         self.assertEqual(quote_path_segment("group/sub/project"), "group%2Fsub%2Fproject")
+
+    def test_calculate_new_expires_at_uses_today_plus_lifetime_days(self) -> None:
+        self.assertEqual(calculate_new_expires_at(date(2026, 5, 16), 90), "2026-08-14")
+
+    def test_run_does_not_rotate_when_token_expiry_is_outside_threshold(self) -> None:
+        config = Config(
+            api_url="https://gitlab.example.com/api/v4",
+            project_id="123",
+            token_var_name="PROJECT_TOKEN",
+            variable_key="PROJECT_TOKEN",
+            token_id="self",
+            threshold_days=1,
+            new_expires_in_days=90,
+            timeout_seconds=30,
+            dry_run=False,
+            variable_environment_scope=None,
+            set_masked=None,
+            set_protected=None,
+            set_raw=None,
+            set_variable_type=None,
+        )
+        with mock.patch.dict(os.environ, {"PROJECT_TOKEN": "old-token"}), mock.patch(
+            __name__ + ".GitLabClient"
+        ) as client_class, mock.patch("builtins.print"):
+            client = client_class.return_value
+            client.project_token_details.return_value = {"id": 42, "expires_at": "2099-01-01"}
+
+            self.assertEqual(run(config), 0)
+
+            client.rotate_project_token.assert_not_called()
+            client.update_project_variable.assert_not_called()
+
+    def test_run_rotates_and_updates_variable_with_new_token(self) -> None:
+        today_text = date.today().isoformat()
+        config = Config(
+            api_url="https://gitlab.example.com/api/v4",
+            project_id="group/sub/project",
+            token_var_name="PROJECT_TOKEN",
+            variable_key="PROJECT_TOKEN",
+            token_id="self",
+            threshold_days=30,
+            new_expires_in_days=90,
+            timeout_seconds=30,
+            dry_run=False,
+            variable_environment_scope="production",
+            set_masked="true",
+            set_protected=None,
+            set_raw=None,
+            set_variable_type=None,
+        )
+        with mock.patch.dict(os.environ, {"PROJECT_TOKEN": "old-token"}), mock.patch(
+            __name__ + ".GitLabClient"
+        ) as client_class, mock.patch("builtins.print"):
+            client = client_class.return_value
+            client.project_token_details.return_value = {"id": 42, "expires_at": today_text}
+            client.rotate_project_token.return_value = {
+                "id": 43,
+                "expires_at": calculate_new_expires_at(date.today(), 90),
+                "token": "new-token",
+            }
+
+            self.assertEqual(run(config), 0)
+
+            client.rotate_project_token.assert_called_once_with(
+                "group/sub/project", "self", calculate_new_expires_at(date.today(), 90)
+            )
+            client.update_project_variable.assert_called_once_with(
+                "group/sub/project",
+                "PROJECT_TOKEN",
+                {"value": "new-token", "environment_scope": "production", "masked": "true"},
+                token="new-token",
+                environment_scope_filter="production",
+            )
 
 
 def main(argv: Optional[list[str]] = None) -> int:
