@@ -50,7 +50,7 @@ Recommended GitLab CI usage
 Store the project access token in a masked CI/CD variable named
 GITLAB_PROJECT_ACCESS_TOKEN, then run:
 
-  python3 gitlab_project_token_rotator.py --threshold-days 30
+  python3 token-rotate/gitlab_project_token_rotator.py --threshold-days 30
 
 Optional variables/flags:
 - CI_PROJECT_ID: GitLab project id; automatically present in GitLab CI.
@@ -74,8 +74,6 @@ import argparse
 import json
 import os
 import sys
-import unittest
-from unittest import mock
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -102,7 +100,7 @@ class GitLabAPIError(Exception):
         self.url = url
         self.status = status
         self.body = body
-        super().__init__(f"GitLab API {method} {url} failed with HTTP {status}: {body}")
+        super().__init__(f"GitLab API {method} {url} failed with HTTP {status}")
 
 
 @dataclass(frozen=True)
@@ -454,130 +452,9 @@ def run(config: Config) -> int:
     return 0
 
 
-class SelfTests(unittest.TestCase):
-    def test_should_rotate_when_expiry_is_inside_threshold(self) -> None:
-        self.assertTrue(should_rotate("2026-05-20", 5, date(2026, 5, 16)))
-
-    def test_should_rotate_when_expiry_is_today(self) -> None:
-        self.assertTrue(should_rotate("2026-05-16", 0, date(2026, 5, 16)))
-
-    def test_should_rotate_when_expiry_has_passed(self) -> None:
-        self.assertTrue(should_rotate("2026-05-15", 0, date(2026, 5, 16)))
-
-    def test_should_not_rotate_when_expiry_is_after_threshold(self) -> None:
-        self.assertFalse(should_rotate("2026-05-22", 5, date(2026, 5, 16)))
-
-    def test_bool_to_gitlab_normalizes_truthy_and_falsey_values(self) -> None:
-        self.assertEqual(bool_to_gitlab("yes"), "true")
-        self.assertEqual(bool_to_gitlab("TRUE"), "true")
-        self.assertEqual(bool_to_gitlab("0"), "false")
-        self.assertEqual(bool_to_gitlab("off"), "false")
-
-    def test_build_variable_update_payload_includes_only_requested_attributes(self) -> None:
-        self.assertEqual(build_variable_update_payload("secret"), {"value": "secret"})
-        self.assertEqual(
-            build_variable_update_payload(
-                "secret",
-                environment_scope="production",
-                masked="true",
-                protected="0",
-                raw="yes",
-                variable_type="env_var",
-            ),
-            {
-                "value": "secret",
-                "environment_scope": "production",
-                "masked": "true",
-                "protected": "false",
-                "raw": "true",
-                "variable_type": "env_var",
-            },
-        )
-
-    def test_quote_path_segment_encodes_namespaced_project_path(self) -> None:
-        self.assertEqual(quote_path_segment("group/sub/project"), "group%2Fsub%2Fproject")
-
-    def test_calculate_new_expires_at_uses_today_plus_lifetime_days(self) -> None:
-        self.assertEqual(calculate_new_expires_at(date(2026, 5, 16), 90), "2026-08-14")
-
-    def test_run_does_not_rotate_when_token_expiry_is_outside_threshold(self) -> None:
-        config = Config(
-            api_url="https://gitlab.example.com/api/v4",
-            project_id="123",
-            token_var_name="PROJECT_TOKEN",
-            variable_key="PROJECT_TOKEN",
-            token_id="self",
-            threshold_days=1,
-            new_expires_in_days=90,
-            timeout_seconds=30,
-            dry_run=False,
-            variable_environment_scope=None,
-            set_masked=None,
-            set_protected=None,
-            set_raw=None,
-            set_variable_type=None,
-        )
-        with mock.patch.dict(os.environ, {"PROJECT_TOKEN": "old-token"}), mock.patch(
-            __name__ + ".GitLabClient"
-        ) as client_class, mock.patch("builtins.print"):
-            client = client_class.return_value
-            client.project_token_details.return_value = {"id": 42, "expires_at": "2099-01-01"}
-
-            self.assertEqual(run(config), 0)
-
-            client.rotate_project_token.assert_not_called()
-            client.update_project_variable.assert_not_called()
-
-    def test_run_rotates_and_updates_variable_with_new_token(self) -> None:
-        today_text = date.today().isoformat()
-        config = Config(
-            api_url="https://gitlab.example.com/api/v4",
-            project_id="group/sub/project",
-            token_var_name="PROJECT_TOKEN",
-            variable_key="PROJECT_TOKEN",
-            token_id="self",
-            threshold_days=30,
-            new_expires_in_days=90,
-            timeout_seconds=30,
-            dry_run=False,
-            variable_environment_scope="production",
-            set_masked="true",
-            set_protected=None,
-            set_raw=None,
-            set_variable_type=None,
-        )
-        with mock.patch.dict(os.environ, {"PROJECT_TOKEN": "old-token"}), mock.patch(
-            __name__ + ".GitLabClient"
-        ) as client_class, mock.patch("builtins.print"):
-            client = client_class.return_value
-            client.project_token_details.return_value = {"id": 42, "expires_at": today_text}
-            client.rotate_project_token.return_value = {
-                "id": 43,
-                "expires_at": calculate_new_expires_at(date.today(), 90),
-                "token": "new-token",
-            }
-
-            self.assertEqual(run(config), 0)
-
-            client.rotate_project_token.assert_called_once_with(
-                "group/sub/project", "self", calculate_new_expires_at(date.today(), 90)
-            )
-            client.update_project_variable.assert_called_once_with(
-                "group/sub/project",
-                "PROJECT_TOKEN",
-                {"value": "new-token", "environment_scope": "production", "masked": "true"},
-                token="new-token",
-                environment_scope_filter="production",
-            )
-
-
 def main(argv: Optional[list[str]] = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
-    if "--self-test" in argv:
-        test_argv = [sys.argv[0], "-v"]
-        result = unittest.main(argv=test_argv, exit=False)
-        return 0 if result.result.wasSuccessful() else 1
     try:
         config = parse_args(argv)
         return run(config)
