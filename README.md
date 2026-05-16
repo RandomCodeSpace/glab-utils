@@ -1,6 +1,7 @@
 # glab-utils
 
 [![Quality](https://img.shields.io/github/actions/workflow/status/RandomCodeSpace/glab-utils/quality.yml?branch=main&label=quality&logo=githubactions&logoColor=white&style=for-the-badge)](https://github.com/RandomCodeSpace/glab-utils/actions/workflows/quality.yml)
+[![Sonar Quality Gate](https://img.shields.io/sonar/quality_gate/RandomCodeSpace_glab-utils?server=https%3A%2F%2Fsonarcloud.io&label=sonar&logo=sonarcloud&logoColor=white&style=for-the-badge)](https://sonarcloud.io/project/overview?id=RandomCodeSpace_glab-utils)
 
 Utilities for GitLab automation.
 
