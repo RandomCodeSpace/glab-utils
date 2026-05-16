@@ -1,0 +1,941 @@
+# Semantic Versioning Script Implementation Plan
+
+> **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
+
+**Goal:** Build one native-Python script that calculates the next semantic version for single-module and multi-module projects, with normal patch bumps and automatic minor release-candidate bumps when an RC/release branch is cut.
+
+**Architecture:** Keep the runtime as a single executable Python file with only standard-library imports. The script will read Git tags, scope them by module name, parse SemVer values, decide the next version from the current branch/mode, and print/write CI-friendly output. Tests will use `unittest`, `tempfile`, and real temporary Git repositories to validate behavior without external packages.
+
+**Tech Stack:** Python 3.10+, standard library only, Git CLI via `subprocess`, `unittest` tests, existing GitHub Actions quality workflow.
+
+---
+
+## Brainstormed Requirements and Decisions
+
+### Primary behavior
+
+1. The caller passes a module name:
+
+   ```bash
+   python3 semantic-version/semantic_version_bumper.py --module token-rotate
+   ```
+
+2. For normal branches, the script generates the next patch version:
+
+   - latest module version: `1.4.7`
+   - next generated version: `1.4.8`
+
+3. When a release-candidate branch is cut, the script bumps the minor version and starts an RC line:
+
+   - latest stable module version: `1.4.7`
+   - branch: `release/1.5`, `rc/1.5`, or `release-candidate/1.5`
+   - next generated version: `1.5.0-rc.1`
+
+4. If the RC branch already has RC versions, increment the RC number:
+
+   - existing module versions: `1.4.7`, `1.5.0-rc.1`, `1.5.0-rc.2`
+   - branch: `release/1.5`
+   - next generated version: `1.5.0-rc.3`
+
+5. If the RC branch name does not include an explicit minor version, bump from the latest stable minor:
+
+   - latest stable module version: `1.4.7`
+   - branch: `release-candidate`
+   - next generated version: `1.5.0-rc.1`
+
+### Important semantics
+
+- Stable versions use SemVer: `MAJOR.MINOR.PATCH`.
+- RC versions use SemVer prerelease format: `MAJOR.MINOR.PATCH-rc.N`.
+- Normal patch generation ignores prerelease versions unless explicitly told otherwise.
+- RC generation is based on the next minor line and patch `0`.
+- Major bumps are intentionally out of scope for the first implementation. Add `--bump major` later if needed.
+
+### Multi-module tag strategy
+
+Use module-scoped Git tags by default:
+
+```text
+<module>/v<version>
+```
+
+Examples:
+
+```text
+token-rotate/v1.4.7
+api/v2.3.0
+worker/v0.8.0-rc.2
+```
+
+Reasoning:
+
+- Git tags are naturally global inside a repository.
+- Multi-module projects need a namespace so each module can advance independently.
+- Slashed tag names are valid Git refs and easy to filter with `git tag --list 'token-rotate/v*'`.
+
+For single-module projects, support a flag to use plain tags:
+
+```bash
+python3 semantic-version/semantic_version_bumper.py \
+  --module root \
+  --tag-template 'v{version}'
+```
+
+Default remains `'{module}/v{version}'` so the behavior is predictable for monorepos.
+
+### Branch/mode strategy
+
+Support both auto-detection and explicit mode:
+
+```bash
+# Auto-detect branch from git or CI env
+python3 semantic-version/semantic_version_bumper.py --module token-rotate
+
+# Explicit branch, useful in CI
+python3 semantic-version/semantic_version_bumper.py \
+  --module token-rotate \
+  --branch "$CI_COMMIT_REF_NAME"
+
+# Explicit mode, useful for deterministic pipelines
+python3 semantic-version/semantic_version_bumper.py \
+  --module token-rotate \
+  --mode rc
+```
+
+Modes:
+
+| Mode | Meaning | Example output |
+| --- | --- | --- |
+| `auto` | Detect from branch pattern | `1.4.8` or `1.5.0-rc.1` |
+| `patch` | Always bump patch | `1.4.8` |
+| `rc` | Bump/start/increment release candidate | `1.5.0-rc.1` |
+
+Default RC branch patterns:
+
+```text
+release/*
+rc/*
+release-candidate/*
+```
+
+The script should also accept custom patterns later, but the first version can keep this hard-coded and documented.
+
+### Output strategy
+
+Always print human-readable output plus machine-readable key/value lines:
+
+```text
+module=token-rotate
+mode=patch
+current_version=1.4.7
+next_version=1.4.8
+tag=token-rotate/v1.4.8
+```
+
+Support writing a dotenv file for CI:
+
+```bash
+python3 semantic-version/semantic_version_bumper.py \
+  --module token-rotate \
+  --write-env version.env
+```
+
+`version.env`:
+
+```text
+MODULE=token-rotate
+VERSION_MODE=patch
+CURRENT_VERSION=1.4.7
+NEXT_VERSION=1.4.8
+NEXT_TAG=token-rotate/v1.4.8
+```
+
+Do not create or push tags in the first implementation. Version calculation should be safe and side-effect free by default. Add optional `--create-tag` only after the calculation behavior is stable.
+
+---
+
+## Proposed CLI Contract
+
+```text
+usage: semantic_version_bumper.py --module MODULE [options]
+
+Required:
+  --module MODULE
+      Logical module name. Used to filter module-scoped tags.
+
+Options:
+  --mode auto|patch|rc
+      Version generation mode. Default: auto.
+
+  --branch BRANCH
+      Branch name used for auto mode. Defaults to Git branch, then CI env vars.
+
+  --tag-template TEMPLATE
+      Tag format. Default: {module}/v{version}.
+      For single-module plain tags, use: v{version}
+
+  --initial-version VERSION
+      Baseline when no prior version exists. Default: 0.0.0.
+      First patch from no tags becomes 0.0.1.
+      First RC from no tags becomes 0.1.0-rc.1.
+
+  --write-env PATH
+      Write CI dotenv output.
+
+  --fetch-tags
+      Run git fetch --tags before reading tags.
+
+  --repo PATH
+      Repository path. Default: current working directory.
+
+  --allow-dirty
+      Allow running with uncommitted changes. Default: allowed for calculate-only mode.
+
+  --json
+      Print JSON output instead of key/value output.
+```
+
+---
+
+## Version Calculation Rules
+
+### Rule 1: Parse SemVer only
+
+Accept:
+
+```text
+1.2.3
+1.2.3-rc.1
+v1.2.3 only after removing tag prefix
+```
+
+Reject/ignore:
+
+```text
+1.2
+1.2.3.4
+1.2.3-beta.1
+foo
+```
+
+First version supports only stable and `rc.N` prerelease versions.
+
+### Rule 2: Patch mode
+
+Given stable versions for a module:
+
+```text
+1.2.0
+1.2.1
+1.3.0-rc.1
+```
+
+Patch mode chooses latest stable only:
+
+```text
+current_version=1.2.1
+next_version=1.2.2
+```
+
+### Rule 3: RC mode with explicit branch minor
+
+Branch examples:
+
+```text
+release/1.3
+rc/1.3
+release-candidate/1.3
+```
+
+Given:
+
+```text
+1.2.5
+```
+
+Next:
+
+```text
+1.3.0-rc.1
+```
+
+### Rule 4: RC mode with existing RCs
+
+Given:
+
+```text
+1.2.5
+1.3.0-rc.1
+1.3.0-rc.2
+```
+
+Next:
+
+```text
+1.3.0-rc.3
+```
+
+### Rule 5: RC mode without explicit branch minor
+
+Given latest stable:
+
+```text
+1.2.5
+```
+
+Branch:
+
+```text
+release-candidate
+```
+
+Next:
+
+```text
+1.3.0-rc.1
+```
+
+### Rule 6: No prior tags
+
+Initial stable baseline defaults to `0.0.0`.
+
+Patch mode:
+
+```text
+0.0.1
+```
+
+RC mode:
+
+```text
+0.1.0-rc.1
+```
+
+---
+
+## Implementation Tasks
+
+### Task 1: Create script skeleton and CLI parser
+
+**Objective:** Add a single executable Python script with argument parsing and no business logic yet.
+
+**Files:**
+- Create: `semantic-version/semantic_version_bumper.py`
+- Test: `semantic-version/test_semantic_version_bumper.py`
+
+**Step 1: Write failing CLI smoke test**
+
+Create `semantic-version/test_semantic_version_bumper.py` with a test that imports the script module using `importlib.util` and checks parser defaults.
+
+```python
+import importlib.util
+import pathlib
+import unittest
+
+SCRIPT = pathlib.Path(__file__).with_name("semantic_version_bumper.py")
+
+
+def load_module():
+    spec = importlib.util.spec_from_file_location("semantic_version_bumper", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+class CliParserTests(unittest.TestCase):
+    def test_parser_defaults_to_auto_mode_and_module_tag_template(self):
+        module = load_module()
+        args = module.parse_args(["--module", "token-rotate"])
+        self.assertEqual(args.module, "token-rotate")
+        self.assertEqual(args.mode, "auto")
+        self.assertEqual(args.tag_template, "{module}/v{version}")
+```
+
+**Step 2: Run test to verify failure**
+
+```bash
+python -m unittest semantic-version/test_semantic_version_bumper.py -v
+```
+
+Expected: FAIL because `semantic_version_bumper.py` does not exist yet.
+
+**Step 3: Implement minimal CLI parser**
+
+Create `semantic-version/semantic_version_bumper.py`:
+
+```python
+#!/usr/bin/env python3
+"""Calculate the next semantic version for a module from Git tags."""
+
+from __future__ import annotations
+
+import argparse
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--module", required=True, help="Logical module name")
+    parser.add_argument("--mode", choices=("auto", "patch", "rc"), default="auto")
+    parser.add_argument("--branch", help="Branch name used for auto mode")
+    parser.add_argument("--tag-template", default="{module}/v{version}")
+    parser.add_argument("--initial-version", default="0.0.0")
+    parser.add_argument("--write-env")
+    parser.add_argument("--fetch-tags", action="store_true")
+    parser.add_argument("--repo", default=".")
+    parser.add_argument("--allow-dirty", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def parse_args(argv=None):
+    return build_parser().parse_args(argv)
+
+
+def main(argv=None) -> int:
+    parse_args(argv)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+**Step 4: Verify pass**
+
+```bash
+python -m unittest semantic-version/test_semantic_version_bumper.py -v
+```
+
+Expected: PASS.
+
+**Step 5: Commit**
+
+```bash
+git add semantic-version/semantic_version_bumper.py semantic-version/test_semantic_version_bumper.py
+git commit -m "feat: add semantic version bumper CLI skeleton"
+```
+
+---
+
+### Task 2: Add SemVer parser and ordering
+
+**Objective:** Parse stable and RC SemVer strings into comparable values.
+
+**Files:**
+- Modify: `semantic-version/semantic_version_bumper.py`
+- Modify: `semantic-version/test_semantic_version_bumper.py`
+
+**Step 1: Add failing tests**
+
+```python
+class SemverParserTests(unittest.TestCase):
+    def test_parse_stable_version(self):
+        module = load_module()
+        version = module.SemVer.parse("1.2.3")
+        self.assertEqual((version.major, version.minor, version.patch), (1, 2, 3))
+        self.assertIsNone(version.rc)
+
+    def test_parse_rc_version(self):
+        module = load_module()
+        version = module.SemVer.parse("1.2.0-rc.4")
+        self.assertEqual((version.major, version.minor, version.patch, version.rc), (1, 2, 0, 4))
+
+    def test_reject_unsupported_prerelease(self):
+        module = load_module()
+        with self.assertRaises(ValueError):
+            module.SemVer.parse("1.2.0-beta.1")
+
+    def test_order_stable_after_rc_for_same_base(self):
+        module = load_module()
+        self.assertLess(module.SemVer.parse("1.2.0-rc.3"), module.SemVer.parse("1.2.0"))
+```
+
+**Step 2: Run failure**
+
+```bash
+python -m unittest semantic-version/test_semantic_version_bumper.py -v
+```
+
+Expected: FAIL because `SemVer` does not exist.
+
+**Step 3: Implement SemVer**
+
+Add a frozen dataclass, regex parser, `is_stable`, `bump_patch`, `next_minor_rc`, and `with_next_rc` helpers. Use only `dataclasses`, `functools.total_ordering`, and `re`.
+
+**Step 4: Verify pass**
+
+```bash
+python -m unittest semantic-version/test_semantic_version_bumper.py -v
+```
+
+Expected: PASS.
+
+**Step 5: Commit**
+
+```bash
+git add semantic-version/semantic_version_bumper.py semantic-version/test_semantic_version_bumper.py
+git commit -m "feat: parse and order semantic versions"
+```
+
+---
+
+### Task 3: Add tag template matching
+
+**Objective:** Convert Git tags into module versions using the configured tag template.
+
+**Files:**
+- Modify: `semantic-version/semantic_version_bumper.py`
+- Modify: `semantic-version/test_semantic_version_bumper.py`
+
+**Step 1: Add failing tests**
+
+Test cases:
+
+```python
+class TagTemplateTests(unittest.TestCase):
+    def test_extract_module_scoped_version(self):
+        module = load_module()
+        self.assertEqual(
+            str(module.extract_version_from_tag("token-rotate/v1.2.3", "token-rotate", "{module}/v{version}")),
+            "1.2.3",
+        )
+
+    def test_ignore_other_module_tag(self):
+        module = load_module()
+        self.assertIsNone(module.extract_version_from_tag("api/v1.2.3", "worker", "{module}/v{version}"))
+
+    def test_extract_single_module_plain_tag(self):
+        module = load_module()
+        self.assertEqual(
+            str(module.extract_version_from_tag("v2.0.1", "root", "v{version}")),
+            "2.0.1",
+        )
+```
+
+**Step 2: Implement**
+
+Implement `extract_version_from_tag(tag, module_name, tag_template)` by converting the template into a strict regex. Escape literal template pieces and replace `{module}` and `{version}` placeholders.
+
+**Step 3: Verify**
+
+```bash
+python -m unittest semantic-version/test_semantic_version_bumper.py -v
+```
+
+Expected: PASS.
+
+**Step 4: Commit**
+
+```bash
+git add semantic-version/semantic_version_bumper.py semantic-version/test_semantic_version_bumper.py
+git commit -m "feat: support module-scoped version tags"
+```
+
+---
+
+### Task 4: Add Git tag discovery
+
+**Objective:** Read tags from a repository through the Git CLI.
+
+**Files:**
+- Modify: `semantic-version/semantic_version_bumper.py`
+- Modify: `semantic-version/test_semantic_version_bumper.py`
+
+**Step 1: Add failing integration-style test**
+
+Use `tempfile.TemporaryDirectory`, `subprocess.run`, and a temporary Git repo:
+
+```python
+class GitTagDiscoveryTests(unittest.TestCase):
+    def test_list_git_tags_from_repo(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = pathlib.Path(tmp)
+            subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+            (repo / "README.md").write_text("test\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "tag", "token-rotate/v1.2.3"], cwd=repo, check=True)
+            self.assertEqual(module.list_git_tags(repo), ["token-rotate/v1.2.3"])
+```
+
+**Step 2: Implement**
+
+Add `run_git(args, repo)` and `list_git_tags(repo)` using `subprocess.run(..., text=True, capture_output=True, check=False)` with friendly errors.
+
+**Step 3: Verify**
+
+```bash
+python -m unittest semantic-version/test_semantic_version_bumper.py -v
+```
+
+Expected: PASS.
+
+**Step 4: Commit**
+
+```bash
+git add semantic-version/semantic_version_bumper.py semantic-version/test_semantic_version_bumper.py
+git commit -m "feat: discover semantic version tags from git"
+```
+
+---
+
+### Task 5: Implement patch version calculation
+
+**Objective:** Generate the next patch version for the selected module.
+
+**Files:**
+- Modify: `semantic-version/semantic_version_bumper.py`
+- Modify: `semantic-version/test_semantic_version_bumper.py`
+
+**Step 1: Add failing tests**
+
+```python
+class PatchCalculationTests(unittest.TestCase):
+    def test_patch_bumps_latest_stable_for_module(self):
+        module = load_module()
+        versions = [module.SemVer.parse(v) for v in ["1.0.0", "1.0.1", "1.1.0-rc.1"]]
+        self.assertEqual(str(module.next_patch_version(versions, module.SemVer.parse("0.0.0"))), "1.0.2")
+
+    def test_patch_from_no_tags_uses_initial_version(self):
+        module = load_module()
+        self.assertEqual(str(module.next_patch_version([], module.SemVer.parse("0.0.0"))), "0.0.1")
+```
+
+**Step 2: Implement**
+
+Patch calculation:
+
+```text
+stable_versions = versions where rc is None
+current = max(stable_versions) or initial_version
+next = current.major.current.minor.(current.patch + 1)
+```
+
+**Step 3: Verify**
+
+```bash
+python -m unittest semantic-version/test_semantic_version_bumper.py -v
+```
+
+Expected: PASS.
+
+**Step 4: Commit**
+
+```bash
+git add semantic-version/semantic_version_bumper.py semantic-version/test_semantic_version_bumper.py
+git commit -m "feat: calculate next patch version"
+```
+
+---
+
+### Task 6: Implement RC branch detection and minor bump
+
+**Objective:** Auto-detect release-candidate branches and calculate minor RC versions.
+
+**Files:**
+- Modify: `semantic-version/semantic_version_bumper.py`
+- Modify: `semantic-version/test_semantic_version_bumper.py`
+
+**Step 1: Add failing tests**
+
+```python
+class RcCalculationTests(unittest.TestCase):
+    def test_release_branch_with_minor_starts_rc_line(self):
+        module = load_module()
+        versions = [module.SemVer.parse("1.4.7")]
+        self.assertEqual(str(module.next_rc_version(versions, module.SemVer.parse("0.0.0"), "release/1.5")), "1.5.0-rc.1")
+
+    def test_release_branch_increments_existing_rc_line(self):
+        module = load_module()
+        versions = [module.SemVer.parse(v) for v in ["1.4.7", "1.5.0-rc.1", "1.5.0-rc.2"]]
+        self.assertEqual(str(module.next_rc_version(versions, module.SemVer.parse("0.0.0"), "release/1.5")), "1.5.0-rc.3")
+
+    def test_release_branch_without_minor_bumps_latest_stable_minor(self):
+        module = load_module()
+        versions = [module.SemVer.parse("1.4.7")]
+        self.assertEqual(str(module.next_rc_version(versions, module.SemVer.parse("0.0.0"), "release-candidate")), "1.5.0-rc.1")
+
+    def test_auto_mode_detects_rc_branch(self):
+        module = load_module()
+        self.assertEqual(module.resolve_mode("auto", "rc/2.0"), "rc")
+```
+
+**Step 2: Implement**
+
+Implementation pieces:
+
+- `resolve_mode(mode, branch)`
+- `extract_major_minor_from_branch(branch)`
+- `next_rc_version(versions, initial_version, branch)`
+
+Branch minor regex:
+
+```text
+(?:release|rc|release-candidate)/(\d+)\.(\d+)
+```
+
+If no branch minor exists, use latest stable `major, minor + 1`.
+
+**Step 3: Verify**
+
+```bash
+python -m unittest semantic-version/test_semantic_version_bumper.py -v
+```
+
+Expected: PASS.
+
+**Step 4: Commit**
+
+```bash
+git add semantic-version/semantic_version_bumper.py semantic-version/test_semantic_version_bumper.py
+git commit -m "feat: calculate release candidate minor versions"
+```
+
+---
+
+### Task 7: Wire end-to-end calculation into CLI output
+
+**Objective:** Make the CLI calculate and print version output from real tags.
+
+**Files:**
+- Modify: `semantic-version/semantic_version_bumper.py`
+- Modify: `semantic-version/test_semantic_version_bumper.py`
+
+**Step 1: Add failing end-to-end tests**
+
+Test running `main([...])` with captured stdout using `contextlib.redirect_stdout`.
+
+Assertions:
+
+- patch mode prints `next_version=...`
+- RC mode prints `mode=rc`
+- tag output uses configured tag template
+- `--json` emits valid JSON
+
+**Step 2: Implement calculation object**
+
+Add a small dataclass:
+
+```python
+@dataclass(frozen=True)
+class VersionResult:
+    module: str
+    mode: str
+    current_version: SemVer | None
+    next_version: SemVer
+    tag: str
+```
+
+Add `calculate_next_version(args)` and output formatters.
+
+**Step 3: Verify**
+
+```bash
+python -m unittest semantic-version/test_semantic_version_bumper.py -v
+```
+
+Expected: PASS.
+
+**Step 4: Commit**
+
+```bash
+git add semantic-version/semantic_version_bumper.py semantic-version/test_semantic_version_bumper.py
+git commit -m "feat: expose semantic version calculation through CLI"
+```
+
+---
+
+### Task 8: Add dotenv output for CI
+
+**Objective:** Support CI systems that pass variables between jobs.
+
+**Files:**
+- Modify: `semantic-version/semantic_version_bumper.py`
+- Modify: `semantic-version/test_semantic_version_bumper.py`
+
+**Step 1: Add failing test**
+
+Use a temporary file path and verify contents:
+
+```text
+MODULE=token-rotate
+VERSION_MODE=patch
+CURRENT_VERSION=1.4.7
+NEXT_VERSION=1.4.8
+NEXT_TAG=token-rotate/v1.4.8
+```
+
+**Step 2: Implement `write_env_file(path, result)`**
+
+Rules:
+
+- Write UTF-8 text.
+- End file with newline.
+- Do not quote values unless needed. Module names/tags should be restricted to safe characters.
+
+**Step 3: Verify**
+
+```bash
+python -m unittest semantic-version/test_semantic_version_bumper.py -v
+```
+
+Expected: PASS.
+
+**Step 4: Commit**
+
+```bash
+git add semantic-version/semantic_version_bumper.py semantic-version/test_semantic_version_bumper.py
+git commit -m "feat: write semantic version output for CI"
+```
+
+---
+
+### Task 9: Add README documentation
+
+**Objective:** Document usage for single-module and multi-module projects.
+
+**Files:**
+- Modify: `README.md`
+
+**Step 1: Add section**
+
+Add `## Semantic version bumper` with:
+
+- purpose
+- tag scheme
+- normal patch example
+- RC branch example
+- GitLab CI/GitHub Actions example
+
+Example GitLab CI:
+
+```yaml
+calculate_version:
+  image: python:3.12-alpine
+  script:
+    - apk add --no-cache git
+    - python3 semantic-version/semantic_version_bumper.py --module token-rotate --branch "$CI_COMMIT_REF_NAME" --write-env version.env
+  artifacts:
+    reports:
+      dotenv: version.env
+```
+
+Example GitHub Actions:
+
+```yaml
+- name: Calculate version
+  run: |
+    python3 semantic-version/semantic_version_bumper.py \
+      --module token-rotate \
+      --branch "${GITHUB_REF_NAME}" \
+      --write-env version.env
+    cat version.env >> "$GITHUB_ENV"
+```
+
+**Step 2: Verify markdown links and commands**
+
+```bash
+python semantic-version/semantic_version_bumper.py --help
+python -m unittest discover -s semantic-version -p 'test_*.py' -v
+```
+
+Expected: help prints successfully, tests pass.
+
+**Step 3: Commit**
+
+```bash
+git add README.md
+git commit -m "docs: document semantic version bumper"
+```
+
+---
+
+### Task 10: Integrate with existing quality checks
+
+**Objective:** Ensure the new script is included in repository quality gates.
+
+**Files:**
+- Modify: `.github/workflows/quality.yml` only if current test discovery does not already include the new folder.
+
+**Step 1: Check current workflow**
+
+Inspect test discovery paths. If it only runs `token-rotate`, either:
+
+1. Add a second test command for `semantic-version`, or
+2. Change discovery to cover all project test files.
+
+Prefer explicit test command to keep behavior obvious:
+
+```bash
+python -m unittest discover -s semantic-version -p 'test_*.py' -v
+```
+
+**Step 2: Run local checks**
+
+```bash
+python -m unittest discover -s token-rotate -p 'test_*.py' -v
+python -m unittest discover -s semantic-version -p 'test_*.py' -v
+python token-rotate/quality_gate.py --min-coverage 95
+python semantic-version/semantic_version_bumper.py --help
+python -m py_compile semantic-version/semantic_version_bumper.py semantic-version/test_semantic_version_bumper.py
+git diff --check
+```
+
+Expected: all pass.
+
+**Step 3: Commit**
+
+```bash
+git add .github/workflows/quality.yml
+git commit -m "ci: include semantic version bumper tests"
+```
+
+---
+
+## Acceptance Criteria
+
+- The implementation is a single runtime script: `semantic-version/semantic_version_bumper.py`.
+- The runtime script uses only Python standard-library imports.
+- The script accepts `--module` and scopes version history to that module.
+- Multi-module repositories can use tags like `module-name/v1.2.3`.
+- Single-module repositories can use plain tags with `--tag-template 'v{version}'`.
+- Normal branches generate the next patch version.
+- RC/release branches generate the next minor RC version.
+- Existing RC versions increment `rc.N` instead of restarting at `rc.1`.
+- No prior tags produce deterministic initial versions.
+- Output is CI-friendly key/value text by default.
+- Optional `--write-env` writes a dotenv file.
+- Unit tests cover SemVer parsing, tag matching, patch generation, RC generation, and end-to-end CLI output.
+- Existing repository quality workflow remains green.
+
+---
+
+## Example Expected Behavior Matrix
+
+| Tags for module | Branch | Mode | Next version | Next tag |
+| --- | --- | --- | --- | --- |
+| none | `main` | `auto` | `0.0.1` | `module/v0.0.1` |
+| `module/v1.2.3` | `main` | `auto` | `1.2.4` | `module/v1.2.4` |
+| `module/v1.2.3` | `feature/foo` | `patch` | `1.2.4` | `module/v1.2.4` |
+| `module/v1.2.3` | `release/1.3` | `auto` | `1.3.0-rc.1` | `module/v1.3.0-rc.1` |
+| `module/v1.2.3`, `module/v1.3.0-rc.1` | `release/1.3` | `auto` | `1.3.0-rc.2` | `module/v1.3.0-rc.2` |
+| `module/v1.2.3`, `other/v9.9.9` | `main` | `auto` | `1.2.4` | `module/v1.2.4` |
+| `v2.0.0` with `--tag-template 'v{version}'` | `main` | `auto` | `2.0.1` | `v2.0.1` |
+
+---
+
+## Open Questions Before Implementation
+
+These are worth confirming before coding if the script will be used across many teams:
+
+1. Should RC branch names always include the target minor, for example `release/1.5`, or should generic `release-candidate` be enough?
+2. Should final release from `1.5.0-rc.3` to `1.5.0` be supported in the first version?
+3. Should the script ever create Git tags, or only calculate the next version?
+4. Should module names allow slashes, for example `services/api`, or should they be simple slugs only?
+5. Should version files be updated, for example `pyproject.toml`, `package.json`, or `__init__.py`, or should CI consume the generated version without editing files?
+
+Recommended first implementation: calculate only, do not tag, do not edit version files. This keeps the script safe, reusable, and easy to test. Add mutation features only after version calculation is trusted.
