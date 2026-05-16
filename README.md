@@ -2,6 +2,12 @@
 
 [![Quality](https://img.shields.io/github/actions/workflow/status/RandomCodeSpace/glab-utils/quality.yml?branch=main&label=quality&logo=githubactions&logoColor=white&style=for-the-badge)](https://github.com/RandomCodeSpace/glab-utils/actions/workflows/quality.yml)
 [![Sonar Quality Gate](https://img.shields.io/sonar/quality_gate/RandomCodeSpace_glab-utils?server=https%3A%2F%2Fsonarcloud.io&label=sonar&logo=sonarcloud&logoColor=white&style=for-the-badge)](https://sonarcloud.io/project/overview?id=RandomCodeSpace_glab-utils)
+[![Coverage](https://img.shields.io/sonar/coverage/RandomCodeSpace_glab-utils?server=https%3A%2F%2Fsonarcloud.io&label=coverage&logo=sonarcloud&logoColor=white&style=for-the-badge)](https://sonarcloud.io/component_measures?id=RandomCodeSpace_glab-utils&metric=coverage)
+[![Bugs](https://img.shields.io/sonar/bugs/RandomCodeSpace_glab-utils?server=https%3A%2F%2Fsonarcloud.io&label=bugs&logo=sonarcloud&logoColor=white&style=for-the-badge)](https://sonarcloud.io/project/issues?id=RandomCodeSpace_glab-utils&resolved=false&types=BUG)
+[![Vulnerabilities](https://img.shields.io/sonar/vulnerabilities/RandomCodeSpace_glab-utils?server=https%3A%2F%2Fsonarcloud.io&label=vulnerabilities&logo=sonarcloud&logoColor=white&style=for-the-badge)](https://sonarcloud.io/project/issues?id=RandomCodeSpace_glab-utils&resolved=false&types=VULNERABILITY)
+[![Security Hotspots](https://img.shields.io/sonar/security_hotspots/RandomCodeSpace_glab-utils?server=https%3A%2F%2Fsonarcloud.io&label=security%20hotspots&logo=sonarcloud&logoColor=white&style=for-the-badge)](https://sonarcloud.io/security_hotspots?id=RandomCodeSpace_glab-utils)
+[![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white&style=for-the-badge)](https://www.python.org/downloads/)
+[![Runtime](https://img.shields.io/badge/runtime-stdlib%20only-2ea44f?logo=python&logoColor=white&style=for-the-badge)](https://docs.python.org/3/library/)
 
 Utilities for GitLab automation.
 
