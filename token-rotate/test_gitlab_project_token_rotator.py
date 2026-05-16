@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for gitlab_project_token_rotator.py.
+"""Unit tests for token_rotate.rotator.py.
 
 Tests use only the Python standard library and mock GitLab API/client behavior;
 no real GitLab API calls are made.
@@ -7,20 +7,12 @@ no real GitLab API calls are made.
 
 from __future__ import annotations
 
-import importlib.util
 import os
-import sys
 import unittest
 from datetime import date
-from pathlib import Path
 from unittest import mock
 
-MODULE_PATH = Path(__file__).with_name("gitlab_project_token_rotator.py")
-SPEC = importlib.util.spec_from_file_location("gitlab_project_token_rotator", MODULE_PATH)
-assert SPEC is not None and SPEC.loader is not None
-rotator = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = rotator
-SPEC.loader.exec_module(rotator)
+from token_rotate import rotator
 
 
 class RotatorUnitTests(unittest.TestCase):
@@ -151,10 +143,40 @@ class RotatorUnitTests(unittest.TestCase):
             with self.assertRaises(rotator.ConfigError):
                 rotator.run(self.make_config())
 
+    def test_oop_rotator_uses_injected_environment_client_and_clock(self) -> None:
+        config = self.make_config(threshold_days=30, new_expires_in_days=90)
+        client = mock.Mock()
+        client.project_token_details.return_value = {"id": 42, "expires_at": "2026-05-16"}
+        client.rotate_project_token.return_value = {
+            "id": 43,
+            "expires_at": "2026-08-14",
+            "token": "new-token",
+        }
+        output = []
+
+        service = rotator.GitLabProjectTokenRotator(
+            config,
+            client_factory=lambda api_url, token, timeout: client,
+            environ={"PROJECT_TOKEN": "old-token"},
+            today_provider=lambda: date(2026, 5, 16),
+            printer=lambda message: output.append(message),
+        )
+
+        self.assertEqual(service.run(), 0)
+        client.rotate_project_token.assert_called_once_with("123", "self", "2026-08-14")
+        client.update_project_variable.assert_called_once_with(
+            "123",
+            "PROJECT_TOKEN",
+            {"value": "new-token"},
+            token="new-token",
+            environment_scope_filter=None,
+        )
+        self.assertTrue(any("token_value=not_printed" in message for message in output))
+
     def test_run_does_not_rotate_when_token_expiry_is_outside_threshold(self) -> None:
         config = self.make_config(threshold_days=1)
         with mock.patch.dict(os.environ, {"PROJECT_TOKEN": "old-token"}), mock.patch(
-            "gitlab_project_token_rotator.GitLabClient"
+            "token_rotate.rotator.GitLabClient"
         ) as client_class, mock.patch("builtins.print"):
             client = client_class.return_value
             client.project_token_details.return_value = {"id": 42, "expires_at": "2099-01-01"}
@@ -167,7 +189,7 @@ class RotatorUnitTests(unittest.TestCase):
     def test_run_dry_run_does_not_mutate_gitlab(self) -> None:
         config = self.make_config(dry_run=True, threshold_days=30)
         with mock.patch.dict(os.environ, {"PROJECT_TOKEN": "old-token"}), mock.patch(
-            "gitlab_project_token_rotator.GitLabClient"
+            "token_rotate.rotator.GitLabClient"
         ) as client_class, mock.patch("builtins.print"):
             client = client_class.return_value
             client.project_token_details.return_value = {"id": 42, "expires_at": date.today().isoformat()}
@@ -186,7 +208,7 @@ class RotatorUnitTests(unittest.TestCase):
             set_masked="true",
         )
         with mock.patch.dict(os.environ, {"PROJECT_TOKEN": "old-token"}), mock.patch(
-            "gitlab_project_token_rotator.GitLabClient"
+            "token_rotate.rotator.GitLabClient"
         ) as client_class, mock.patch("builtins.print"):
             client = client_class.return_value
             client.project_token_details.return_value = {"id": 42, "expires_at": today_text}
@@ -212,7 +234,7 @@ class RotatorUnitTests(unittest.TestCase):
     def test_run_rejects_rotate_response_without_new_token(self) -> None:
         config = self.make_config(threshold_days=30)
         with mock.patch.dict(os.environ, {"PROJECT_TOKEN": "old-token"}), mock.patch(
-            "gitlab_project_token_rotator.GitLabClient"
+            "token_rotate.rotator.GitLabClient"
         ) as client_class, mock.patch("builtins.print"):
             client = client_class.return_value
             client.project_token_details.return_value = {"id": 42, "expires_at": date.today().isoformat()}
@@ -319,9 +341,12 @@ class RotatorUnitTests(unittest.TestCase):
             fp=mock.Mock(read=lambda: b'{"message":"forbidden"}'),
         )
         client = rotator.GitLabClient("https://gitlab.example.com/api/v4", "default-token", 30)
-        with mock.patch("urllib.request.urlopen", side_effect=error):
-            with self.assertRaises(rotator.GitLabAPIError) as raised:
-                client.request("GET", "/fail")
+        try:
+            with mock.patch("urllib.request.urlopen", side_effect=error):
+                with self.assertRaises(rotator.GitLabAPIError) as raised:
+                    client.request("GET", "/fail")
+        finally:
+            error.close()
         self.assertEqual(raised.exception.status, 403)
 
     def test_gitlab_client_request_wraps_url_error(self) -> None:
@@ -381,7 +406,7 @@ class RotatorUnitTests(unittest.TestCase):
     def test_run_exits_without_rotation_when_token_has_no_expiry(self) -> None:
         config = self.make_config()
         with mock.patch.dict(os.environ, {"PROJECT_TOKEN": "old-token"}), mock.patch(
-            "gitlab_project_token_rotator.GitLabClient"
+            "token_rotate.rotator.GitLabClient"
         ) as client_class, mock.patch("builtins.print"):
             client = client_class.return_value
             client.project_token_details.return_value = {"id": 42, "expires_at": None}
@@ -392,15 +417,15 @@ class RotatorUnitTests(unittest.TestCase):
             client.update_project_variable.assert_not_called()
 
     def test_main_returns_zero_when_run_succeeds(self) -> None:
-        with mock.patch("gitlab_project_token_rotator.parse_args", return_value=self.make_config()) as parse_args, mock.patch(
-            "gitlab_project_token_rotator.run", return_value=0
+        with mock.patch("token_rotate.rotator.parse_args", return_value=self.make_config()) as parse_args, mock.patch(
+            "token_rotate.rotator.run", return_value=0
         ) as run:
             self.assertEqual(rotator.main(["--project-id", "1"]), 0)
         parse_args.assert_called_once_with(["--project-id", "1"])
         run.assert_called_once()
 
     def test_main_returns_one_when_config_error_is_raised(self) -> None:
-        with mock.patch("gitlab_project_token_rotator.parse_args", side_effect=rotator.ConfigError("bad config")), mock.patch(
+        with mock.patch("token_rotate.rotator.parse_args", side_effect=rotator.ConfigError("bad config")), mock.patch(
             "sys.stderr"
         ):
             self.assertEqual(rotator.main(["--project-id", "1"]), 1)

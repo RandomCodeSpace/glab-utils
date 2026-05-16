@@ -121,28 +121,36 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Confirm production script uses only standard-library imports
+      - name: Confirm production code uses only standard-library or local imports
         run: |
           python - <<'PY'
           import ast
           import pathlib
           import sys
 
-          source = pathlib.Path("token-rotate/gitlab_project_token_rotator.py")
-          tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
-          allowed_local = {"__future__"}
+          sources = [pathlib.Path("token-rotate/gitlab_project_token_rotator.py")]
+          sources.extend(pathlib.Path("token-rotate/token_rotate").glob("*.py"))
+          allowed_local = {"__future__", "token_rotate"}
           stdlib = set(getattr(sys, "stdlib_module_names", ())) | allowed_local
-          imported = set()
-          for node in ast.walk(tree):
-              if isinstance(node, ast.Import):
-                  imported.update(alias.name.split(".")[0] for alias in node.names)
-              elif isinstance(node, ast.ImportFrom) and node.module:
-                  imported.add(node.module.split(".")[0])
-          third_party = sorted(name for name in imported if name not in stdlib)
-          if third_party:
-              print("Non-standard-library imports found in production script:", third_party)
+          failures = []
+          for source in sources:
+              tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+              imported = set()
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Import):
+                      imported.update(alias.name.split(".")[0] for alias in node.names)
+                  elif isinstance(node, ast.ImportFrom) and node.module:
+                      if node.level:
+                          continue
+                      imported.add(node.module.split(".")[0])
+              third_party = sorted(name for name in imported if name not in stdlib)
+              if third_party:
+                  failures.append(f"{source}: {third_party}")
+          if failures:
+              print("Non-standard-library imports found in production code:")
+              print("\n".join(failures))
               sys.exit(1)
-          print("Production script imports are standard-library only.")
+          print("Production code imports are standard-library or local package only.")
           PY
 
       - name: Compile every tracked Python file

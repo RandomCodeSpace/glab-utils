@@ -19,7 +19,7 @@ def main() -> int:
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent
-    source_file = root / "gitlab_project_token_rotator.py"
+    package_dir = root / "token_rotate"
 
     try:
         import coverage  # type: ignore
@@ -29,7 +29,7 @@ def main() -> int:
         return 2
 
     cov = coverage.Coverage(
-        source=[str(root)],
+        source=[str(package_dir)],
         omit=[str(root / "test_*.py"), str(root / "quality_gate.py")],
         branch=True,
     )
@@ -39,7 +39,7 @@ def main() -> int:
     cov.stop()
     cov.save()
 
-    percent = cov.report(include=[str(source_file)], show_missing=True)
+    percent = cov.report(include=[str(package_dir / "*.py")], show_missing=True)
     print(f"Coverage quality gate: required >= {args.min_coverage:.2f}%, actual = {percent:.2f}%")
 
     if not result.wasSuccessful():
