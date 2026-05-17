@@ -175,9 +175,21 @@ Base version rules:
 | Branch/mode | Base version | Snapshot output example |
 | --- | --- | --- |
 | `main` / `snapshot` | next patch from latest stable | `1.4.8-snapshot.732.a1b2c3d4` |
-| feature branch / `snapshot` | next patch from latest stable | `1.4.8-snapshot.feature-login.732.a1b2c3d4` if branch slug is enabled |
+| feature branch / `snapshot` | next patch from latest stable, or MR target release line | `1.4.8-snapshot.feature-login.732.a1b2c3d4` |
+| MR source branch targeting `release/1.5` | target release line from `CI_MERGE_REQUEST_TARGET_BRANCH_NAME` | `1.5.0-snapshot.feature-login.732.a1b2c3d4` |
 | `release/1.5` / `snapshot` | target release line | `1.5.0-snapshot.732.a1b2c3d4` |
 | after existing `1.5.0-rc.2` | next RC base without reserving it | `1.5.0-rc.3.snapshot.732.a1b2c3d4` |
+
+Feature branch snapshot policy:
+
+- Always include the sanitized source branch slug by default for readability and package cleanup.
+- Use `CI_COMMIT_REF_SLUG` for normal branch pipelines.
+- Use `CI_MERGE_REQUEST_SOURCE_BRANCH_NAME` or `CI_COMMIT_REF_SLUG` for MR source identity.
+- If `CI_MERGE_REQUEST_TARGET_BRANCH_NAME` matches a release branch pattern such as `release/1.5`, use that target line as the base version.
+- Otherwise, use the next patch after the latest stable module tag from the GitLab Tags API.
+- Do not query branch reachability and do not fetch history; feature branch snapshots are not release lineage decisions.
+- Publish to a snapshot/dev package channel keyed by module and branch slug, for example `snapshots/<module>/<branch-slug>/<version>`.
+- Configure retention/cleanup on the snapshot channel; feature branch snapshots should disappear after merge or after a fixed TTL.
 
 Important: if strict SemVer precedence matters, avoid publishing snapshots to the same channel as immutable releases/RCs. SemVer prerelease ordering can be surprising for mixed labels like `rc.3.snapshot.732`. The safest operational rule is: snapshots go to a snapshot/dev repository or package channel; releases and RCs go to release channels.
 
