@@ -83,6 +83,62 @@ python3 semantic-version/semantic_version_bumper.py \
 
 Default remains `'{module}/v{version}'` so the behavior is predictable for monorepos.
 
+### Large tag repository strategy
+
+A repository with hundreds of thousands or millions of tags must not run `git fetch --tags` in every pipeline. The script should support a GitLab API tag source so CI can query only relevant tag names instead of downloading all tag refs and tag objects.
+
+Recommended source priority:
+
+1. `gitlab-api` in GitLab CI for large repositories.
+2. `ls-remote` for generic remote-only tag discovery when the GitLab API is not available.
+3. `git` local tags only for small repositories or local developer runs.
+
+GitLab API query shape:
+
+```text
+GET /projects/:id/repository/tags?search=^<module>/v&order_by=version&sort=desc&per_page=100
+```
+
+Important notes:
+
+- URL-encode the project id/path and the `search` value.
+- GitLab's tag API supports `search` with `^term` for prefix matching and supports `order_by=version` for semantic-version ordering.
+- Still parse and validate versions client-side because tags may include invalid names, non-SemVer tags, or tags from older conventions.
+- For RC generation, query the narrowest prefix possible, for example `^token-rotate/v1.5.0-rc.`.
+- If a module has more than one page of matching tags, follow pagination headers or keyset pagination. Do not assume the first page is sufficient unless the query prefix is narrow enough to prove it.
+
+GitLab CI should keep checkout shallow and prevent runner auto-fetching tags:
+
+```yaml
+variables:
+  GIT_DEPTH: "1"
+  GIT_FETCH_EXTRA_FLAGS: "--no-tags"
+```
+
+Then calculate versions from the GitLab API:
+
+```bash
+python3 semantic-version/semantic_version_bumper.py \
+  --module token-rotate \
+  --tag-source gitlab-api \
+  --branch "$CI_COMMIT_REF_NAME" \
+  --write-env version.env
+```
+
+Fallback if API access is not available and Git CLI must be used:
+
+```bash
+git fetch --no-tags origin '+refs/tags/token-rotate/v*:refs/tags/token-rotate/v*'
+```
+
+This fetches only the module-scoped tag namespace. For RC branches, fetch an even narrower namespace:
+
+```bash
+git fetch --no-tags origin '+refs/tags/token-rotate/v1.5.0-rc.*:refs/tags/token-rotate/v1.5.0-rc.*'
+```
+
+Avoid branch reachability checks such as `git tag --merged` in the first version because they require commit history and defeat shallow-checkout performance. Tags are global refs, not branch-local refs. If the business rule needs branch-specific versions, encode the release line into the tag prefix or branch name instead of trying to infer it from commit reachability.
+
 ### Branch/mode strategy
 
 Support both auto-detection and explicit mode:
@@ -183,7 +239,15 @@ Options:
       Write CI dotenv output.
 
   --fetch-tags
-      Run git fetch --tags before reading tags.
+      Run git fetch --tags before reading tags. Intended only for small repos.
+
+  --tag-source git|gitlab-api|ls-remote
+      Tag discovery source. Default: git for local runs, gitlab-api when GitLab CI
+      variables are present. Large repositories should use gitlab-api.
+
+  --gitlab-token-var NAME
+      CI/CD variable that contains a GitLab API token. Default: CI_JOB_TOKEN,
+      falling back to GITLAB_TOKEN. Never print this value.
 
   --repo PATH
       Repository path. Default: current working directory.
@@ -583,7 +647,69 @@ git commit -m "feat: discover semantic version tags from git"
 
 ---
 
-### Task 5: Implement patch version calculation
+### Task 5: Add GitLab API tag discovery for large repositories
+
+**Objective:** Query only module-relevant tags from GitLab without fetching all tags into the job workspace.
+
+**Files:**
+- Modify: `semantic-version/semantic_version_bumper.py`
+- Modify: `semantic-version/test_semantic_version_bumper.py`
+
+**Step 1: Add failing tests with mocked HTTP responses**
+
+Use `unittest.mock` to patch `urllib.request.urlopen` and verify:
+
+- the request URL contains `/projects/<id>/repository/tags`
+- the query string includes `search=%5Etoken-rotate%2Fv`
+- the query string includes `order_by=version`, `sort=desc`, and `per_page=100`
+- returned tag names are extracted from JSON
+- pagination is followed when GitLab returns a `Link` or `X-Next-Page` header
+
+**Step 2: Implement `list_gitlab_tags(api_url, project_id, token, search_prefix)`**
+
+Use only standard-library modules:
+
+- `urllib.request`
+- `urllib.parse`
+- `json`
+
+Authentication behavior:
+
+- Prefer `JOB-TOKEN` when using `CI_JOB_TOKEN`.
+- Use `PRIVATE-TOKEN` when using a project/group/personal access token variable such as `GITLAB_TOKEN`.
+- Never print the token or response bodies that could include sensitive data.
+
+**Step 3: Add source selection**
+
+Implement `--tag-source git|gitlab-api|ls-remote`.
+
+Default logic:
+
+```text
+if CI_API_V4_URL and CI_PROJECT_ID are present:
+    tag_source = gitlab-api
+else:
+    tag_source = git
+```
+
+**Step 4: Verify**
+
+```bash
+python -m unittest semantic-version/test_semantic_version_bumper.py -v
+```
+
+Expected: PASS.
+
+**Step 5: Commit**
+
+```bash
+git add semantic-version/semantic_version_bumper.py semantic-version/test_semantic_version_bumper.py
+git commit -m "feat: query module tags through GitLab API"
+```
+
+---
+
+### Task 6: Implement patch version calculation
 
 **Objective:** Generate the next patch version for the selected module.
 
