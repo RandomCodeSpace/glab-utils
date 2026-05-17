@@ -139,6 +139,65 @@ git fetch --no-tags origin '+refs/tags/token-rotate/v1.5.0-rc.*:refs/tags/token-
 
 Avoid branch reachability checks such as `git tag --merged` in the first version because they require commit history and defeat shallow-checkout performance. Tags are global refs, not branch-local refs. If the business rule needs branch-specific versions, encode the release line into the tag prefix or branch name instead of trying to infer it from commit reachability.
 
+### GitLab CI_JOB_TOKEN release and tag mutation strategy
+
+The script should support a mutation mode that uses GitLab's built-in `CI_JOB_TOKEN` so a release job can reserve a version without storing a long-lived project access token just for tagging.
+
+Important GitLab permission reality:
+
+- `CI_JOB_TOKEN` authenticates REST calls with the `JOB-TOKEN` header.
+- GitLab's job token can read the Tags API endpoints needed for discovery: `GET /projects/:id/repository/tags` and `GET /projects/:id/repository/tags/:tag_name`.
+- GitLab's Releases API accepts `CI_JOB_TOKEN` with the `JOB-TOKEN` header and supports release creation.
+- Creating a tag directly through `POST /projects/:id/repository/tags` may require a normal API token because the documented job-token Tags API access is read-only. Do not depend on that endpoint for job-token tag creation.
+
+Recommended job-token reservation model:
+
+1. Calculate the next version and tag name.
+2. Check current-commit refs with `GET /projects/:id/repository/commits/:sha/refs?type=tag`.
+3. Check the exact tag with `GET /projects/:id/repository/tags/:tag_name`.
+4. If the tag already exists on the current commit, reuse it and exit successfully.
+5. If the tag exists on a different commit, fail hard; never move release tags automatically.
+6. If the tag does not exist, create a GitLab release with `POST /projects/:id/releases` using `JOB-TOKEN: $CI_JOB_TOKEN`, `tag_name=<tag>`, and `ref=$CI_COMMIT_SHA`. GitLab creates the tag as part of release creation when the tag is missing.
+7. If release creation returns a conflict, re-read the release/tag and verify it points at the same commit before treating the run as idempotent success.
+
+This means the first mutation feature should be named around release reservation, not generic tag pushing:
+
+```bash
+python3 semantic-version/semantic_version_bumper.py \
+  --module token-rotate \
+  --mode rc \
+  --tag-source gitlab-api \
+  --reserve-release \
+  --gitlab-auth job-token
+```
+
+For release trains from `main`/`master`:
+
+```bash
+python3 semantic-version/semantic_version_bumper.py \
+  --mode rc \
+  --release-scope train \
+  --modules-file modules.json \
+  --tag-source gitlab-api \
+  --reserve-release \
+  --gitlab-auth job-token
+```
+
+If a team needs tag-only mutation without creating a GitLab release, support it as an explicit advanced mode only when prerequisites are met:
+
+1. `--tag-mutation git-push` uses `git push` over HTTPS authenticated as `gitlab-ci-token:$CI_JOB_TOKEN`.
+2. The GitLab project must enable **Allow Git push requests to the repository** for job tokens.
+3. The user who started the pipeline must have sufficient project permission.
+4. Job-token git pushes do not trigger CI pipelines, so release jobs must not rely on a tag pipeline being triggered by that push.
+
+For maximum portability, the default mutation strategy should be:
+
+```text
+--reserve-release --gitlab-auth job-token --tag-mutation release-api
+```
+
+Use a project/group/personal access token only when a GitLab instance does not allow job-token Releases API calls or when the business explicitly requires direct Tags API creation.
+
 ### Snapshot version strategy
 
 Snapshots should be treated as ephemeral CI artifact versions, not permanent version reservations. The script should not scan tags, create tags, or update a central counter just to produce a snapshot. For performance, generate snapshots from the next release base plus GitLab CI's already-available unique identifiers.
@@ -477,6 +536,31 @@ Options:
       CI/CD variable that contains a GitLab API token. Default: CI_JOB_TOKEN,
       falling back to GITLAB_TOKEN. Never print this value.
 
+  --gitlab-auth auto|job-token|private-token
+      Authentication header strategy for GitLab API calls. Default: auto.
+      job-token sends JOB-TOKEN and is intended for CI_JOB_TOKEN.
+      private-token sends PRIVATE-TOKEN and is intended for GITLAB_TOKEN or PATs.
+
+  --reserve-release
+      After calculating the immutable release/RC version, reserve it in GitLab by
+      creating or reusing a release/tag. Intended only for patch/rc release jobs,
+      not snapshot mode.
+
+  --release-ref REF
+      Commit SHA, branch, or tag to release. Default: CI_COMMIT_SHA, then HEAD.
+
+  --release-name-template TEMPLATE
+      GitLab release name template. Default: {tag}.
+
+  --release-description-file PATH
+      Optional Markdown file used as the GitLab release description.
+
+  --tag-mutation release-api|git-push|none
+      How to create a missing tag when --reserve-release is set. Default:
+      release-api. release-api uses POST /projects/:id/releases, which works
+      with CI_JOB_TOKEN on supported GitLab versions. git-push requires the
+      project setting that allows CI_JOB_TOKEN pushes.
+
   --repo PATH
       Repository path. Default: current working directory.
 
@@ -587,21 +671,52 @@ Next:
 1.3.0-rc.1
 ```
 
-### Rule 6: No prior tags
+### Rule 6: No prior tags / first version
 
-Initial stable baseline defaults to `0.0.0`.
+The default no-tag behavior treats `--initial-version` as a logical baseline, not as a previously published tag. The default baseline is `0.0.0`.
 
-Patch mode:
+Patch mode with no prior tags:
 
 ```text
 0.0.1
 ```
 
-RC mode:
+RC mode with no prior tags and no explicit release line:
 
 ```text
 0.1.0-rc.1
 ```
+
+RC mode with an explicit branch release line should use that line even when no tags exist:
+
+```text
+branch=release/1.0
+next=1.0.0-rc.1
+```
+
+For a real product's first public release, prefer an explicit target version instead of relying on defaults:
+
+```bash
+python3 semantic-version/semantic_version_bumper.py \
+  --module api \
+  --mode rc \
+  --target-version 1.0.0-rc.1 \
+  --reserve-release
+```
+
+or use an explicit release branch:
+
+```bash
+python3 semantic-version/semantic_version_bumper.py \
+  --module api \
+  --mode rc \
+  --branch release/1.0 \
+  --reserve-release
+```
+
+For release trains, the same rule applies to the train tag. With no existing train tags, either provide `--target-version 1.0.0-rc.1` or run from a branch/ref that clearly encodes the first train line, such as `release/1.0`.
+
+Do not create fake bootstrap tags solely to make the calculation work. If a migration needs to preserve an existing externally published version, set `--initial-version` to the latest external stable version or pass `--target-version` for the first reserved release.
 
 ---
 
@@ -1234,7 +1349,127 @@ git commit -m "feat: write semantic version output for CI"
 
 ---
 
-### Task 11: Add README documentation
+### Task 11: Add GitLab job-token release reservation
+
+**Objective:** Allow a release job to reserve immutable versions using GitLab's built-in `CI_JOB_TOKEN`, without fetching tags or storing a long-lived API token for the common release path.
+
+**Files:**
+- Modify: `semantic-version/semantic_version_bumper.py`
+- Modify: `semantic-version/test_semantic_version_bumper.py`
+
+**Step 1: Add failing mocked GitLab client tests**
+
+Use `unittest.mock` around `urllib.request.urlopen` and verify:
+
+- `CI_JOB_TOKEN` uses the `JOB-TOKEN` header, never `PRIVATE-TOKEN`.
+- `GITLAB_TOKEN` or an explicitly private token uses the `PRIVATE-TOKEN` header.
+- `get_tag(tag_name)` URL-encodes slashes in tags like `module-a/v1.2.3`.
+- `create_release(tag_name, ref, ...)` posts to `/projects/:id/releases` with form-encoded `tag_name`, `ref`, `name`, and `description`.
+- `reserve_release_tag(...)` returns idempotent success when the tag already points at the requested commit.
+- `reserve_release_tag(...)` fails when the tag exists but points at a different commit.
+- A `409 Conflict` from release creation is handled by re-reading the tag/release and verifying the commit before returning success.
+- `--reserve-release` is rejected in `snapshot` mode.
+
+Example test intent:
+
+```python
+class GitLabReleaseReservationTests(unittest.TestCase):
+    def test_job_token_uses_job_token_header_for_release_creation(self):
+        module = load_module()
+        client = module.GitLabClient(
+            api_url="https://gitlab.example/api/v4",
+            project_id="123",
+            token="job-token-value",
+            auth_mode="job-token",
+        )
+        request = client.build_request("/projects/123/releases", method="POST", data={"tag_name": "module/v1.0.0", "ref": "abc"})
+        self.assertEqual(request.headers["Job-token"], "job-token-value")
+        self.assertNotIn("Private-token", request.headers)
+```
+
+**Step 2: Implement GitLab mutation helpers**
+
+Add or extend `GitLabClient` with standard-library-only methods:
+
+```text
+build_request(path, method="GET", query=None, data=None)
+get_current_commit_tags(sha)
+get_tag(tag_name)
+get_release(tag_name)
+create_release(tag_name, ref, name, description, tag_message=None)
+reserve_release_tag(tag_name, ref, name, description, if_exists)
+```
+
+Implementation notes:
+
+- Use `JOB-TOKEN` for `auth_mode=job-token` and `PRIVATE-TOKEN` for `auth_mode=private-token`.
+- In `auth_mode=auto`, choose `job-token` when `--gitlab-token-var` resolves to `CI_JOB_TOKEN`; otherwise choose `private-token`.
+- URL-encode project ids and tag names with `urllib.parse.quote(value, safe="")`.
+- Treat HTTP `404` as missing tag/release.
+- Treat HTTP `409` during create as a possible race; re-read and verify before failing.
+- Never log raw response bodies by default because they may contain request echoes or sensitive metadata.
+
+**Step 3: Wire CLI options**
+
+Add:
+
+```text
+--reserve-release
+--release-ref
+--release-name-template
+--release-description-file
+--tag-mutation release-api|git-push|none
+--gitlab-auth auto|job-token|private-token
+```
+
+Validation rules:
+
+- `--reserve-release` requires `--tag-source gitlab-api` or enough GitLab CI env to construct a client.
+- `--reserve-release` is invalid with `--mode snapshot`.
+- `--tag-mutation release-api` uses `POST /projects/:id/releases` and is the default.
+- `--tag-mutation git-push` must be opt-in and should print a prerequisite warning unless `--json` is used.
+- `--tag-mutation none` validates idempotency only; it never creates a tag or release.
+
+**Step 4: Preserve idempotency**
+
+Reservation flow:
+
+```text
+if current commit already has expected release/train tag:
+    return success, reserved=false, reused=true
+elif exact tag exists on same commit:
+    return success, reserved=false, reused=true
+elif exact tag exists on different commit:
+    fail immutable-tag-conflict
+elif tag_mutation == none:
+    fail missing-tag
+elif tag_mutation == release-api:
+    create GitLab release with tag_name and ref
+    return success, reserved=true, reused=false
+elif tag_mutation == git-push:
+    create annotated/local tag and push exactly refs/tags/<tag>
+    return success, reserved=true, reused=false
+```
+
+**Step 5: Verify**
+
+```bash
+python -m unittest semantic-version/test_semantic_version_bumper.py -v
+python -m py_compile semantic-version/semantic_version_bumper.py semantic-version/test_semantic_version_bumper.py
+```
+
+Expected: PASS.
+
+**Step 6: Commit**
+
+```bash
+git add semantic-version/semantic_version_bumper.py semantic-version/test_semantic_version_bumper.py
+git commit -m "feat: reserve GitLab releases with CI job token"
+```
+
+---
+
+### Task 12: Add README documentation
 
 **Objective:** Document usage for single-module and multi-module projects.
 
@@ -1250,6 +1485,8 @@ Add `## Semantic version bumper` with:
 - normal patch example
 - RC branch example
 - GitLab CI/GitHub Actions example
+- GitLab `CI_JOB_TOKEN` release reservation example
+- first-version behavior and how to bootstrap `1.0.0-rc.1`
 
 Example GitLab CI:
 
@@ -1263,6 +1500,33 @@ calculate_version:
     reports:
       dotenv: version.env
 ```
+
+Example GitLab release reservation with `CI_JOB_TOKEN`:
+
+```yaml
+reserve_release:
+  image: python:3.12-alpine
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+  variables:
+    GIT_DEPTH: "1"
+    GIT_FETCH_EXTRA_FLAGS: "--no-tags"
+  script:
+    - python3 semantic-version/semantic_version_bumper.py \
+        --module token-rotate \
+        --mode rc \
+        --tag-source gitlab-api \
+        --reserve-release \
+        --gitlab-auth job-token \
+        --release-ref "$CI_COMMIT_SHA" \
+        --write-env version.env
+  artifacts:
+    reports:
+      dotenv: version.env
+```
+
+For the first public RC, either run from an explicit branch such as `release/1.0` or pass `--target-version 1.0.0-rc.1` to avoid accidentally starting at the default `0.1.0-rc.1`.
 
 Example GitHub Actions:
 
@@ -1294,7 +1558,7 @@ git commit -m "docs: document semantic version bumper"
 
 ---
 
-### Task 12: Integrate with existing quality checks
+### Task 13: Integrate with existing quality checks
 
 **Objective:** Ensure the new script is included in repository quality gates.
 
@@ -1351,7 +1615,10 @@ git commit -m "ci: include semantic version bumper tests"
 - Optional `--write-env` writes a dotenv file.
 - Snapshot mode generates unique versions from `CI_PIPELINE_IID` and `CI_COMMIT_SHORT_SHA` without creating tags or reserving counters.
 - Large repositories can use GitLab API tag filtering instead of fetching all tags/history.
-- Unit tests cover SemVer parsing, tag matching, patch generation, RC generation, snapshot generation, and end-to-end CLI output.
+- Release jobs can use `CI_JOB_TOKEN` with the `JOB-TOKEN` header to create or reuse GitLab releases/tags through the Releases API.
+- Direct tag creation with `CI_JOB_TOKEN` is not assumed; tag-only mutation requires explicit `--tag-mutation git-push` and project settings that allow job-token pushes.
+- First-version behavior is deterministic: defaults start at `0.0.1` for patch and `0.1.0-rc.1` for generic RC, while `--target-version` or `release/1.0` bootstraps `1.0.0-rc.1`.
+- Unit tests cover SemVer parsing, tag matching, patch generation, RC generation, snapshot generation, GitLab release reservation, and end-to-end CLI output.
 - Existing repository quality workflow remains green.
 
 ---
@@ -1361,6 +1628,8 @@ git commit -m "ci: include semantic version bumper tests"
 | Tags for module | Branch | Mode | Next version | Next tag |
 | --- | --- | --- | --- | --- |
 | none | `main` | `auto` | `0.0.1` | `module/v0.0.1` |
+| none | `release/1.0` | `auto` | `1.0.0-rc.1` | `module/v1.0.0-rc.1` |
+| none with `--target-version 1.0.0-rc.1` | `main` | `rc` | `1.0.0-rc.1` | `module/v1.0.0-rc.1` |
 | `module/v1.2.3` | `main` | `auto` | `1.2.4` | `module/v1.2.4` |
 | `module/v1.2.3` | `feature/foo` | `patch` | `1.2.4` | `module/v1.2.4` |
 | `module/v1.2.3` | `release/1.3` | `auto` | `1.3.0-rc.1` | `module/v1.3.0-rc.1` |
@@ -1378,10 +1647,10 @@ These are worth confirming before coding if the script will be used across many 
 
 1. Should RC branch names always include the target minor, for example `release/1.5`, or should generic `release-candidate` be enough?
 2. Should final release from `1.5.0-rc.3` to `1.5.0` be supported in the first version?
-3. Should the script ever create Git tags, or only calculate the next version?
+3. Should tag-only mutation be supported beyond GitLab release reservation, or is creating/reusing a GitLab Release enough for all release jobs?
 4. Should module names allow slashes, for example `services/api`, or should they be simple slugs only?
 5. Should version files be updated, for example `pyproject.toml`, `package.json`, or `__init__.py`, or should CI consume the generated version without editing files?
 6. Should snapshots use strict SemVer prerelease style, Maven-style `-SNAPSHOT`, or an ecosystem-specific template?
 7. Should snapshots be unique only per pipeline, or is a per-module sequential snapshot counter required?
 
-Recommended first implementation: calculate only, do not tag, do not edit version files. This keeps the script safe, reusable, and easy to test. Add mutation features only after version calculation is trusted.
+Recommended first implementation: calculate versions first, then add GitLab release reservation as an explicit opt-in mutation path guarded by `--reserve-release`. Do not edit version files in the first release of the script.
