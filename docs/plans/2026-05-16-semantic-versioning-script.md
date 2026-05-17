@@ -139,6 +139,56 @@ git fetch --no-tags origin '+refs/tags/token-rotate/v1.5.0-rc.*:refs/tags/token-
 
 Avoid branch reachability checks such as `git tag --merged` in the first version because they require commit history and defeat shallow-checkout performance. Tags are global refs, not branch-local refs. If the business rule needs branch-specific versions, encode the release line into the tag prefix or branch name instead of trying to infer it from commit reachability.
 
+### Snapshot version strategy
+
+Snapshots should be treated as ephemeral CI artifact versions, not permanent version reservations. The script should not scan tags, create tags, or update a central counter just to produce a snapshot. For performance, generate snapshots from the next release base plus GitLab CI's already-available unique identifiers.
+
+Recommended snapshot format for SemVer-compatible consumers:
+
+```text
+<base-version>-snapshot.<pipeline-iid>.<commit-short-sha>
+```
+
+Examples:
+
+```text
+1.4.8-snapshot.732.a1b2c3d4
+1.5.0-rc.3.snapshot.733.a1b2c3d4
+```
+
+If a target package ecosystem requires Maven-style snapshots, support a template override:
+
+```bash
+--snapshot-template '{base_version}-SNAPSHOT'
+```
+
+Default behavior:
+
+- `snapshot` mode never creates a tag.
+- `snapshot` mode never increments or reserves the patch/RC counter.
+- Snapshot uniqueness comes from `CI_PIPELINE_IID` plus `CI_COMMIT_SHORT_SHA`.
+- Snapshot ordering is good enough for CI artifacts because `CI_PIPELINE_IID` is monotonic inside a GitLab project.
+- Module name should be part of the artifact path or package coordinates, not necessarily part of the SemVer string.
+
+Base version rules:
+
+| Branch/mode | Base version | Snapshot output example |
+| --- | --- | --- |
+| `main` / `snapshot` | next patch from latest stable | `1.4.8-snapshot.732.a1b2c3d4` |
+| feature branch / `snapshot` | next patch from latest stable | `1.4.8-snapshot.feature-login.732.a1b2c3d4` if branch slug is enabled |
+| `release/1.5` / `snapshot` | target release line | `1.5.0-snapshot.732.a1b2c3d4` |
+| after existing `1.5.0-rc.2` | next RC base without reserving it | `1.5.0-rc.3.snapshot.732.a1b2c3d4` |
+
+Important: if strict SemVer precedence matters, avoid publishing snapshots to the same channel as immutable releases/RCs. SemVer prerelease ordering can be surprising for mixed labels like `rc.3.snapshot.732`. The safest operational rule is: snapshots go to a snapshot/dev repository or package channel; releases and RCs go to release channels.
+
+If the business requires per-module sequential snapshot numbers, do not derive that from Git tags. Use one of these explicit state stores instead:
+
+1. GitLab project/group variable per module, updated only by a serialized release/snapshot job.
+2. GitLab Generic Package Registry state file such as `version-state/<module>/state.json`.
+3. A small external version service.
+
+For the first implementation, avoid stateful snapshot counters. Use `CI_PIPELINE_IID` for unique snapshots and keep state only for immutable releases/RCs.
+
 ### Branch/mode strategy
 
 Support both auto-detection and explicit mode:
@@ -165,6 +215,7 @@ Modes:
 | `auto` | Detect from branch pattern | `1.4.8` or `1.5.0-rc.1` |
 | `patch` | Always bump patch | `1.4.8` |
 | `rc` | Bump/start/increment release candidate | `1.5.0-rc.1` |
+| `snapshot` | Generate an ephemeral CI artifact version without reserving it | `1.4.8-snapshot.732.a1b2c3d4` |
 
 Default RC branch patterns:
 
@@ -220,7 +271,7 @@ Required:
       Logical module name. Used to filter module-scoped tags.
 
 Options:
-  --mode auto|patch|rc
+  --mode auto|patch|rc|snapshot
       Version generation mode. Default: auto.
 
   --branch BRANCH
@@ -237,6 +288,13 @@ Options:
 
   --write-env PATH
       Write CI dotenv output.
+
+  --snapshot-template TEMPLATE
+      Format for snapshot versions. Default:
+      {base_version}-snapshot.{pipeline_iid}.{commit_short_sha}
+
+  --snapshot-include-branch
+      Include the sanitized branch slug in snapshot versions.
 
   --fetch-tags
       Run git fetch --tags before reading tags. Intended only for small repos.
@@ -758,7 +816,7 @@ git commit -m "feat: calculate next patch version"
 
 ---
 
-### Task 6: Implement RC branch detection and minor bump
+### Task 7: Implement RC branch detection and minor bump
 
 **Objective:** Auto-detect release-candidate branches and calculate minor RC versions.
 
@@ -823,7 +881,93 @@ git commit -m "feat: calculate release candidate minor versions"
 
 ---
 
-### Task 7: Wire end-to-end calculation into CLI output
+### Task 8: Implement snapshot version calculation
+
+**Objective:** Generate unique ephemeral snapshot versions without fetching all tags or reserving a release number.
+
+**Files:**
+- Modify: `semantic-version/semantic_version_bumper.py`
+- Modify: `semantic-version/test_semantic_version_bumper.py`
+
+**Step 1: Add failing tests**
+
+Add tests for:
+
+```python
+class SnapshotCalculationTests(unittest.TestCase):
+    def test_snapshot_uses_next_patch_base_and_ci_identifiers(self):
+        module = load_module()
+        versions = [module.SemVer.parse("1.4.7")]
+        result = module.next_snapshot_version(
+            versions=versions,
+            initial_version=module.SemVer.parse("0.0.0"),
+            branch="main",
+            pipeline_iid="732",
+            commit_short_sha="a1b2c3d4",
+            include_branch=False,
+        )
+        self.assertEqual(result, "1.4.8-snapshot.732.a1b2c3d4")
+
+    def test_release_branch_snapshot_uses_release_line_without_reserving_rc(self):
+        module = load_module()
+        versions = [module.SemVer.parse("1.4.7")]
+        result = module.next_snapshot_version(
+            versions=versions,
+            initial_version=module.SemVer.parse("0.0.0"),
+            branch="release/1.5",
+            pipeline_iid="733",
+            commit_short_sha="b2c3d4e5",
+            include_branch=False,
+        )
+        self.assertEqual(result, "1.5.0-snapshot.733.b2c3d4e5")
+```
+
+**Step 2: Implement snapshot helpers**
+
+Implement:
+
+- `sanitize_prerelease_identifier(value)` for branch slugs.
+- `resolve_snapshot_base(versions, initial_version, branch)`.
+- `next_snapshot_version(...)`.
+
+Use `CI_PIPELINE_IID` and `CI_COMMIT_SHORT_SHA` by default when CLI flags are not provided. If they are missing outside CI, fall back to `0` and the local Git short SHA, or fail with a clear message when Git is unavailable.
+
+**Step 3: Add CLI options**
+
+Add:
+
+```text
+--mode snapshot
+--snapshot-template
+--snapshot-include-branch
+--pipeline-iid
+--commit-short-sha
+```
+
+Default template:
+
+```text
+{base_version}-snapshot.{pipeline_iid}.{commit_short_sha}
+```
+
+**Step 4: Verify**
+
+```bash
+python -m unittest semantic-version/test_semantic_version_bumper.py -v
+```
+
+Expected: PASS.
+
+**Step 5: Commit**
+
+```bash
+git add semantic-version/semantic_version_bumper.py semantic-version/test_semantic_version_bumper.py
+git commit -m "feat: calculate ephemeral snapshot versions"
+```
+
+---
+
+### Task 9: Wire end-to-end calculation into CLI output
 
 **Objective:** Make the CLI calculate and print version output from real tags.
 
@@ -875,7 +1019,7 @@ git commit -m "feat: expose semantic version calculation through CLI"
 
 ---
 
-### Task 8: Add dotenv output for CI
+### Task 10: Add dotenv output for CI
 
 **Objective:** Support CI systems that pass variables between jobs.
 
@@ -920,7 +1064,7 @@ git commit -m "feat: write semantic version output for CI"
 
 ---
 
-### Task 9: Add README documentation
+### Task 11: Add README documentation
 
 **Objective:** Document usage for single-module and multi-module projects.
 
@@ -980,7 +1124,7 @@ git commit -m "docs: document semantic version bumper"
 
 ---
 
-### Task 10: Integrate with existing quality checks
+### Task 12: Integrate with existing quality checks
 
 **Objective:** Ensure the new script is included in repository quality gates.
 
@@ -1035,7 +1179,9 @@ git commit -m "ci: include semantic version bumper tests"
 - No prior tags produce deterministic initial versions.
 - Output is CI-friendly key/value text by default.
 - Optional `--write-env` writes a dotenv file.
-- Unit tests cover SemVer parsing, tag matching, patch generation, RC generation, and end-to-end CLI output.
+- Snapshot mode generates unique versions from `CI_PIPELINE_IID` and `CI_COMMIT_SHORT_SHA` without creating tags or reserving counters.
+- Large repositories can use GitLab API tag filtering instead of fetching all tags/history.
+- Unit tests cover SemVer parsing, tag matching, patch generation, RC generation, snapshot generation, and end-to-end CLI output.
 - Existing repository quality workflow remains green.
 
 ---
@@ -1051,6 +1197,8 @@ git commit -m "ci: include semantic version bumper tests"
 | `module/v1.2.3`, `module/v1.3.0-rc.1` | `release/1.3` | `auto` | `1.3.0-rc.2` | `module/v1.3.0-rc.2` |
 | `module/v1.2.3`, `other/v9.9.9` | `main` | `auto` | `1.2.4` | `module/v1.2.4` |
 | `v2.0.0` with `--tag-template 'v{version}'` | `main` | `auto` | `2.0.1` | `v2.0.1` |
+| `module/v1.4.7` | `main` | `snapshot` | `1.4.8-snapshot.732.a1b2c3d4` | none |
+| `module/v1.4.7` | `release/1.5` | `snapshot` | `1.5.0-snapshot.733.b2c3d4e5` | none |
 
 ---
 
@@ -1063,5 +1211,7 @@ These are worth confirming before coding if the script will be used across many 
 3. Should the script ever create Git tags, or only calculate the next version?
 4. Should module names allow slashes, for example `services/api`, or should they be simple slugs only?
 5. Should version files be updated, for example `pyproject.toml`, `package.json`, or `__init__.py`, or should CI consume the generated version without editing files?
+6. Should snapshots use strict SemVer prerelease style, Maven-style `-SNAPSHOT`, or an ecosystem-specific template?
+7. Should snapshots be unique only per pipeline, or is a per-module sequential snapshot counter required?
 
 Recommended first implementation: calculate only, do not tag, do not edit version files. This keeps the script safe, reusable, and easy to test. Add mutation features only after version calculation is trusted.
