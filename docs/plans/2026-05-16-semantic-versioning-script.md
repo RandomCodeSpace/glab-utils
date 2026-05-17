@@ -1379,11 +1379,11 @@ class GitLabReleaseReservationTests(unittest.TestCase):
         client = module.GitLabClient(
             api_url="https://gitlab.example/api/v4",
             project_id="123",
-            token="job-token-value",
+            token="dummy",
             auth_mode="job-token",
         )
         request = client.build_request("/projects/123/releases", method="POST", data={"tag_name": "module/v1.0.0", "ref": "abc"})
-        self.assertEqual(request.headers["Job-token"], "job-token-value")
+        self.assertEqual(request.headers["Job-token"], "dummy")
         self.assertNotIn("Private-token", request.headers)
 ```
 
