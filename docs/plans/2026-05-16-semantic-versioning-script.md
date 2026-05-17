@@ -238,6 +238,80 @@ For even stronger safety, support an explicit target version:
 
 When `--target-version` is provided, the script should validate and use that version instead of calculating the next one. This is useful for manual release jobs, approvals, and reruns.
 
+### Main/master all-module release train strategy
+
+If every release from `main`/`master` intentionally creates a new release candidate and bumps the minor line for all modules, treat that as a **release train**, not as N independent module releases.
+
+Problem to avoid:
+
+```text
+module-a/v1.5.0-rc.1
+module-b/v4.2.0-rc.1
+module-c/v0.9.0-rc.1
+```
+
+calculated separately for every module on every release job. That causes unnecessary API calls, version drift, and accidental all-module bumps when the job is retried.
+
+Recommended release-train model:
+
+```text
+release/v1.5.0-rc.1       # single train reservation tag
+release/v1.5.0            # final train release tag
+```
+
+Then each module artifact derives its version from the train:
+
+```text
+module-a -> 1.5.0-rc.1
+module-b -> 1.5.0-rc.1
+module-c -> 1.5.0-rc.1
+```
+
+If module-specific tags are still required for downstream systems, create them as secondary aliases after the train version is reserved:
+
+```text
+module-a/v1.5.0-rc.1
+module-b/v1.5.0-rc.1
+module-c/v1.5.0-rc.1
+```
+
+But the source of truth should remain the train tag or a release manifest, not per-module version calculation.
+
+Efficient algorithm for all-module release from `main`/`master`:
+
+1. Check whether the current commit already has a `release/v*-rc.*` or `release/v*` train tag with `GET /projects/:id/repository/commits/:sha/refs?type=tag`.
+2. If the train tag exists on this commit, reuse it for all modules. This makes release job retries idempotent.
+3. If no train tag exists, query only train tags with `search=^release/v&order_by=version&sort=desc&per_page=100`.
+4. Calculate the next train version once.
+5. Create the train tag once.
+6. Generate a release manifest that lists every module and the same train version.
+7. Optionally create module alias tags only if required.
+
+Release manifest example:
+
+```json
+{
+  "train": "1.5.0-rc.1",
+  "commit": "<CI_COMMIT_SHA>",
+  "modules": {
+    "module-a": "1.5.0-rc.1",
+    "module-b": "1.5.0-rc.1",
+    "module-c": "1.5.0-rc.1"
+  }
+}
+```
+
+This avoids scanning module tags for every module. For a monorepo with many modules, it changes release discovery from `O(number_of_modules)` tag queries to one train-tag query plus one commit-refs idempotency check.
+
+Support two release scopes:
+
+| Scope | Behavior | Use when |
+| --- | --- | --- |
+| `module` | Calculate a version for one module from module tags | modules version independently |
+| `train` | Calculate one version and apply it to all modules | every release bumps all modules together |
+
+For `main`/`master`, prefer explicit release jobs over auto-RC on every push. In other words, normal `main` builds can produce snapshots, while a manual/scheduled release job uses `--release-scope train --mode rc` or `--release-scope train --mode patch`.
+
 ### Branch/mode strategy
 
 Support both auto-detection and explicit mode:
@@ -347,6 +421,17 @@ Options:
 
   --target-version VERSION
       Explicit immutable release/RC version to validate and use instead of calculating.
+
+  --release-scope module|train
+      Versioning scope. Default: module. Use train when a main/master release
+      intentionally applies the same release/RC version to all modules.
+
+  --modules-file PATH
+      Optional newline, JSON, or simple manifest file listing modules for train mode.
+      Used to write a release manifest and optional module alias tags.
+
+  --train-tag-template TEMPLATE
+      Tag format for release train reservations. Default: release/v{version}.
 
   --if-exists skip|fail
       Behavior when release artifact/package already exists. Default: fail.
