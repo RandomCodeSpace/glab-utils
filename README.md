@@ -101,10 +101,143 @@ Use `--variable-environment-scope` when the project has duplicate variable keys 
 
 Important: GitLab returns the newly rotated token only once. If rotation succeeds but updating the CI/CD variable fails, the new token may not be recoverable from logs. Keep enough API permission on the token so the script can complete both rotation and variable update.
 
+## Semantic version bumper
+
+`semantic-version/semantic_version_bumper.py` is a single-file Python utility that calculates module-scoped semantic versions and can optionally reserve immutable GitLab releases/tags from CI.
+
+The runtime uses only the Python standard library. No pip dependencies are required.
+
+### Tag model
+
+Default module tags use:
+
+```text
+<module>/v<version>
+```
+
+Examples:
+
+```text
+api/v1.2.3
+worker/v0.9.0-rc.2
+```
+
+For a single-module repository, use plain tags with:
+
+```bash
+python3 semantic-version/semantic_version_bumper.py \
+  --module root \
+  --tag-template 'v{version}'
+```
+
+### Calculate versions
+
+Next patch from existing tags:
+
+```bash
+python3 semantic-version/semantic_version_bumper.py \
+  --module api \
+  --mode patch
+```
+
+Release candidate from an explicit release line:
+
+```bash
+python3 semantic-version/semantic_version_bumper.py \
+  --module api \
+  --mode rc \
+  --branch release/1.5
+```
+
+No prior tags are deterministic:
+
+```text
+patch mode -> 0.0.1
+generic rc mode -> 0.1.0-rc.1
+release/1.0 rc mode -> 1.0.0-rc.1
+```
+
+For the first public release, prefer an explicit target version:
+
+```bash
+python3 semantic-version/semantic_version_bumper.py \
+  --module api \
+  --mode rc \
+  --target-version 1.0.0-rc.1
+```
+
+Snapshot versions can be customized without changing release tag behavior:
+
+```bash
+python3 semantic-version/semantic_version_bumper.py \
+  --module api \
+  --mode snapshot \
+  --snapshot-template '{base_version}-snapshot.{pipeline_iid}.{commit_short_sha}'
+```
+
+### GitLab API tag discovery
+
+For large repositories, avoid fetching all tags. Use GitLab API tag filtering:
+
+```bash
+python3 semantic-version/semantic_version_bumper.py \
+  --module api \
+  --tag-source gitlab-api \
+  --branch "$CI_COMMIT_REF_NAME" \
+  --write-env version.env
+```
+
+Recommended CI checkout settings:
+
+```yaml
+variables:
+  GIT_DEPTH: "1"
+  GIT_FETCH_EXTRA_FLAGS: "--no-tags"
+```
+
+### Reserve releases with CI_JOB_TOKEN
+
+Release jobs can create or reuse GitLab releases/tags with the built-in job token:
+
+```yaml
+reserve_release:
+  image: python:3.12-alpine
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+  variables:
+    GIT_DEPTH: "1"
+    GIT_FETCH_EXTRA_FLAGS: "--no-tags"
+  script:
+    - python3 semantic-version/semantic_version_bumper.py \
+        --module api \
+        --mode rc \
+        --tag-source gitlab-api \
+        --reserve-release \
+        --gitlab-auth job-token \
+        --release-ref "$CI_COMMIT_SHA" \
+        --write-env version.env
+  artifacts:
+    reports:
+      dotenv: version.env
+```
+
+The script uses `JOB-TOKEN: $CI_JOB_TOKEN` and the GitLab Releases API. It does not assume direct `POST /repository/tags` works with job tokens. If a release job is retried after the tag was already created on the same commit, the script reuses that current-commit tag instead of incrementing again.
+
+### Local checks
+
+```bash
+python -m unittest discover -s semantic-version -p 'test_*.py' -v
+python semantic-version/semantic_version_bumper.py --help
+python semantic-version/semantic_version_bumper.py --self-test
+```
+
 ## Local checks
 
 ```bash
 python -m unittest discover -s token-rotate -p 'test_*.py' -v
+python -m unittest discover -s semantic-version -p 'test_*.py' -v
 python token-rotate/quality_gate.py --min-coverage 95
 python token-rotate/gitlab_project_token_rotator.py --help
+python semantic-version/semantic_version_bumper.py --help
 ```

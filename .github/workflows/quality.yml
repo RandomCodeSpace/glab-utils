@@ -128,7 +128,10 @@ jobs:
           import pathlib
           import sys
 
-          sources = [pathlib.Path("token-rotate/gitlab_project_token_rotator.py")]
+          sources = [
+              pathlib.Path("token-rotate/gitlab_project_token_rotator.py"),
+              pathlib.Path("semantic-version/semantic_version_bumper.py"),
+          ]
           sources.extend(pathlib.Path("token-rotate/token_rotate").glob("*.py"))
           allowed_local = {"__future__", "token_rotate"}
           stdlib = set(getattr(sys, "stdlib_module_names", ())) | allowed_local
@@ -169,7 +172,9 @@ jobs:
           PY
 
       - name: Run unit tests without coverage first
-        run: python -m unittest discover -s token-rotate -p 'test_*.py' -v
+        run: |
+          python -m unittest discover -s token-rotate -p 'test_*.py' -v
+          python -m unittest discover -s semantic-version -p 'test_*.py' -v
 
       - name: Install coverage quality tool
         run: python -m pip install --upgrade coverage
@@ -192,8 +197,11 @@ jobs:
         run: |
           python token-rotate/gitlab_project_token_rotator.py --help >/tmp/rotator-help.txt
           python token-rotate/quality_gate.py --help >/tmp/quality-gate-help.txt
+          python semantic-version/semantic_version_bumper.py --help >/tmp/semantic-version-help.txt
+          python semantic-version/semantic_version_bumper.py --self-test
           test -s /tmp/rotator-help.txt
           test -s /tmp/quality-gate-help.txt
+          test -s /tmp/semantic-version-help.txt
 
   sonar:
     name: sonar scan
