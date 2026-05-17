@@ -201,6 +201,43 @@ If the business requires per-module sequential snapshot numbers, do not derive t
 
 For the first implementation, avoid stateful snapshot counters. Use `CI_PIPELINE_IID` for unique snapshots and keep state only for immutable releases/RCs.
 
+### Release rerun and idempotency strategy
+
+Release jobs are different from snapshots: releases and RCs are immutable version reservations. Running the same release job multiple times must not accidentally advance `1.4.8` to `1.4.9` or `1.5.0-rc.1` to `1.5.0-rc.2` just because the job was retried.
+
+Recommended behavior:
+
+1. Determine whether the current commit already has a module-scoped release tag before calculating a new version.
+2. If the expected release tag already exists and points to the same commit, treat the rerun as idempotent success and reuse that version.
+3. If the tag exists but points to a different commit, fail hard. Never move release tags automatically.
+4. If the package/version already exists, verify it belongs to the same commit/build metadata; then either skip publishing or fail depending on `--if-exists skip|fail`.
+5. Only calculate the next version when no release tag already exists for the current commit and release mode.
+
+Efficient GitLab API checks:
+
+- Use `GET /projects/:id/repository/commits/:sha/refs?type=tag` to check tags that point at the current commit.
+- Filter those refs by the module tag template, for example `payment-service/v*`.
+- Use the Tags API with a module prefix only when no current-commit tag is found and the script needs to calculate the next release/RC.
+
+Release job policy matrix:
+
+| Situation | Behavior |
+| --- | --- |
+| Manual job retry in the same pipeline after tag was created | Reuse existing tag/version and exit success |
+| Whole pipeline rerun on the same commit after tag was created | Reuse existing tag/version and exit success |
+| Release tag exists for same version but different commit | Fail; human must resolve |
+| Artifact/package version already exists for same commit | Skip publish or exit success based on policy |
+| Artifact/package version exists but commit/digest differs | Fail; immutable artifact conflict |
+| No release tag exists for current commit | Calculate next release/RC from filtered GitLab tags |
+
+For even stronger safety, support an explicit target version:
+
+```bash
+--target-version 1.4.8
+```
+
+When `--target-version` is provided, the script should validate and use that version instead of calculating the next one. This is useful for manual release jobs, approvals, and reruns.
+
 ### Branch/mode strategy
 
 Support both auto-detection and explicit mode:
@@ -307,6 +344,12 @@ Options:
 
   --snapshot-include-branch
       Include the sanitized branch slug in snapshot versions.
+
+  --target-version VERSION
+      Explicit immutable release/RC version to validate and use instead of calculating.
+
+  --if-exists skip|fail
+      Behavior when release artifact/package already exists. Default: fail.
 
   --fetch-tags
       Run git fetch --tags before reading tags. Intended only for small repos.
