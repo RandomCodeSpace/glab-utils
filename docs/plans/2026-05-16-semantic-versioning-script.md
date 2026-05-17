@@ -259,12 +259,42 @@ release/v1.5.0-rc.1       # single train reservation tag
 release/v1.5.0            # final train release tag
 ```
 
-Then each module artifact derives its version from the train:
+Then each module artifact derives its version from the train.
+
+If the organization allows all modules to share the same release version, use the train version directly:
 
 ```text
 module-a -> 1.5.0-rc.1
 module-b -> 1.5.0-rc.1
 module-c -> 1.5.0-rc.1
+```
+
+If modules must keep independent version lines, keep the train as the release event id and store per-module versions in the release manifest. The first RC for a new train bumps each module's minor version once; job retries and later reruns reuse the manifest instead of bumping minor again:
+
+```json
+{
+  "train": "2026.05-rc.1",
+  "commit": "<CI_COMMIT_SHA>",
+  "modules": {
+    "module-a": "1.5.0-rc.1",
+    "module-b": "4.3.0-rc.1",
+    "module-c": "0.10.0-rc.1"
+  }
+}
+```
+
+For the final release of the same train, the script removes the RC suffix from the manifest versions:
+
+```json
+{
+  "train": "2026.05",
+  "commit": "<CI_COMMIT_SHA>",
+  "modules": {
+    "module-a": "1.5.0",
+    "module-b": "4.3.0",
+    "module-c": "0.10.0"
+  }
+}
 ```
 
 If module-specific tags are still required for downstream systems, create them as secondary aliases after the train version is reserved:
@@ -284,7 +314,7 @@ Efficient algorithm for all-module release from `main`/`master`:
 3. If no train tag exists, query only train tags with `search=^release/v&order_by=version&sort=desc&per_page=100`.
 4. Calculate the next train version once.
 5. Create the train tag once.
-6. Generate a release manifest that lists every module and the same train version.
+6. Generate or reuse a release manifest. If modules share one version, every module maps to the train version. If modules keep independent version lines, bump each module's minor once only when the manifest for that train is first created.
 7. Optionally create module alias tags only if required.
 
 Release manifest example:
